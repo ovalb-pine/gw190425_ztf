@@ -1,0 +1,32 @@
+# Pipeline configuration
+trigger_date: "2022-02-19"
+lookback_days: 10
+snr_threshold: 3.0
+snr_method: daostarfinder
+braai_threshold: 0.25
+host_rmag_threshold: 22.5
+sigma: 3.0
+maxiters: 5
+min_valid_pixel: -5000.0
+max_ref_sep_arcsec: 3.0
+triplet_size: 63
+ref_flip_lr: true
+
+# Paths (relative to project root)
+diff_root: "diff_ZTF22aabjpxh"
+sci_root: "../ztf_sci_cutout_imgs"
+ref_root: "../ztf_ref_cutout_imgs"
+ref_meta: "../metadata_ZTF22aabjpxh.csv"
+# final_class_csv: "ZTF22aabjpxh_galaxy_catalog.csv"
+final_class_csv: "numbered_galaxies.csv"
+out_root: "ZTF22aabjpxh_candidate_pipeline_out"
+model_path: "../braai/models/braai_d6_m9.h5"
+
+# Processing options
+download_missing: true
+limit_images: 0
+object_ids: []
+max_workers: 4
+chunk_size: 200
+log_level: "INFO"
+resume: true
