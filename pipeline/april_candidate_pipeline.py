@@ -922,21 +922,75 @@ def stage3_pretrigger_magnitude(
             rownum = final_rownum_map.get(obj_norm, obj_norm)
             search_csv = out_dir / f"pretrigger_search_{rownum}.csv"
             search_progress = out_dir / f"pretrigger_search_{rownum}.progress.json"
-            try:
-                df_meta = metadata_search_resumable(
-                    positions=[(ra, dec)],
-                    output_csv=str(search_csv),
-                    progress_json=str(search_progress),
-                    batch_size=50,
-                    size_deg=0.01,
-                    product_type="sci",
-                    filtercodes=["zr"],          # <-- r‑band only
-                    date_start=window_start.strftime("%Y-%m-%d"),
-                    date_end=trigger.strftime("%Y-%m-%d"),
-                    timeout=120,
-                )
-            except Exception as e:
-                logging.warning(f"Metadata search failed for {obj}: {e}")
+            # Robust metadata fetch: try normal batch, then longer timeout/retries,
+            # then fall back to per-day queries if IRSA is timing out or returning
+            # transient errors.
+            from ztf_downloads.ztf_search import metadata_search_batch
+
+            def _fetch_meta():
+                # primary attempt: short timeout
+                try:
+                    return metadata_search_resumable(
+                        positions=[(ra, dec)],
+                        output_csv=str(search_csv),
+                        progress_json=str(search_progress),
+                        batch_size=50,
+                        size_deg=0.01,
+                        product_type="sci",
+                        filtercodes=["zr"],
+                        date_start=window_start.strftime("%Y-%m-%d"),
+                        date_end=trigger.strftime("%Y-%m-%d"),
+                        timeout=120,
+                    )
+                except Exception as e1:
+                    logging.warning(f"Metadata search initial attempt failed for {obj}: {e1}")
+                # Second attempt: longer timeout and more retries
+                try:
+                    return metadata_search_resumable(
+                        positions=[(ra, dec)],
+                        output_csv=str(search_csv),
+                        progress_json=str(search_progress),
+                        batch_size=50,
+                        size_deg=0.01,
+                        product_type="sci",
+                        filtercodes=["zr"],
+                        date_start=window_start.strftime("%Y-%m-%d"),
+                        date_end=trigger.strftime("%Y-%m-%d"),
+                        timeout=300,
+                        max_retries=8,
+                    )
+                except Exception as e2:
+                    logging.warning(f"Metadata search extended attempt failed for {obj}: {e2}")
+
+                # Final fallback: split date range into per-day POST queries to reduce server load
+                try:
+                    parts = []
+                    # iterate day-by-day
+                    day_start = pd.to_datetime(window_start).normalize()
+                    day_end = pd.to_datetime(trigger).normalize()
+                    cur = day_start
+                    while cur < day_end:
+                        ds = cur.strftime("%Y-%m-%d")
+                        de = (cur + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+                        try:
+                            part = metadata_search_batch(positions=[(ra, dec)], size_deg=0.01, product_type="sci", ct="csv", date_start=ds, date_end=de, filtercodes=["zr"], timeout=180)
+                            if part is None:
+                                part = pd.DataFrame()
+                            parts.append(part)
+                        except Exception as e3:
+                            logging.warning(f"Per-day metadata search failed for {obj} {ds}->{de}: {e3}")
+                        cur += pd.Timedelta(days=1)
+                    if parts:
+                        return pd.concat(parts, ignore_index=True) if any(len(p) for p in parts) else pd.DataFrame()
+                except Exception as e4:
+                    logging.warning(f"Per-day fallback failed for {obj}: {e4}")
+
+                # all attempts failed
+                return pd.DataFrame()
+
+            df_meta = _fetch_meta()
+            if df_meta is None or df_meta.empty:
+                logging.warning(f"Metadata search yielded no results for {obj}")
                 continue
 
             if df_meta is None or df_meta.empty:
@@ -1428,109 +1482,136 @@ def save_stage4_results(final_candidates: pd.DataFrame, final_class_df: pd.DataF
                     ssel = stage1_images[stage1_images["object_id"].astype(str).map(normalize_object_id) == oid].copy()
 
                 if not ssel.empty:
-                    def _parse_obs_from_fname(pth):
+                    # prefer magnitudes if available, otherwise use SNR as fallback
+                    ssel["mag"] = _pd.to_numeric(ssel.get("mag"), errors="coerce")
+                    ssel["mag_err"] = _pd.to_numeric(ssel.get("mag_err"), errors="coerce")
+                    ssel["upper_limit"] = _pd.to_numeric(ssel.get("upper_limit"), errors="coerce")
+                    ssel["snr"] = _pd.to_numeric(ssel.get("snr"), errors="coerce")
+
+                    # Extract filefracday-derived fractional day for plotting (day-of-year + fraction)
+                    def _extract_t_frac(pth):
                         try:
                             name = Path(str(pth)).name
                             parsed = parse_diff_name(name)
                             if parsed and parsed.get("filefracday"):
-                                ffd = str(parsed["filefracday"])
+                                ffd = str(parsed["filefracday"]).strip()
                                 if len(ffd) >= 14:
-                                    return _pd.to_datetime(ffd[:14], format="%Y%m%d%H%M%S", errors="coerce")
+                                    dt = _pd.to_datetime(ffd[:14], format="%Y%m%d%H%M%S", errors="coerce")
+                                    if pd.notna(dt):
+                                        return float(dt.dayofyear) + (dt.hour * 3600 + dt.minute * 60 + dt.second) / 86400.0
                                 if len(ffd) >= 8:
-                                    return _pd.to_datetime(ffd[:8], format="%Y%m%d", errors="coerce")
+                                    date = _pd.to_datetime(ffd[:8], format="%Y%m%d", errors="coerce")
+                                    if pd.notna(date):
+                                        frac = 0.0
+                                        if len(ffd) > 8:
+                                            try:
+                                                frac = float(f"0.{ffd[8:]}")
+                                            except Exception:
+                                                frac = 0.0
+                                        return float(date.dayofyear) + frac
+                        except Exception:
+                            pass
+                        return _np.nan
+
+                    ssel["t_frac"] = ssel.get("image_path").apply(_extract_t_frac)
+
+                    # Extract human date and filter label for xticks and color grouping
+                    def _extract_date_filter_label(pth):
+                        try:
+                            name = Path(str(pth)).name
+                            parsed = parse_diff_name(name)
+                            if parsed and parsed.get("filefracday"):
+                                ffd = str(parsed["filefracday"]).strip()
+                                if len(ffd) >= 8:
+                                    d = ffd[:8]
+                                    return f"{d[0:4]}-{d[4:6]}-{d[6:8]} ({parsed.get('filter', '?')})"
+                        except Exception:
+                            pass
+                        return Path(str(pth)).name
+
+                    ssel["date_label"] = ssel.get("image_path").apply(_extract_date_filter_label)
+
+                    # Prefer a precise datetime parsed from filefracday when available
+                    def _extract_obs_datetime(pth):
+                        try:
+                            name = Path(str(pth)).name
+                            parsed = parse_diff_name(name)
+                            if parsed and parsed.get("filefracday"):
+                                ffd = str(parsed["filefracday"]).strip()
+                                if len(ffd) >= 14:
+                                    dt = _pd.to_datetime(ffd[:14], format="%Y%m%d%H%M%S", errors="coerce")
+                                    if pd.notna(dt):
+                                        return dt
+                                if len(ffd) >= 8:
+                                    base = _pd.to_datetime(ffd[:8], format="%Y%m%d", errors="coerce")
+                                    if pd.isna(base):
+                                        return _pd.NaT
+                                    frac = 0.0
+                                    if len(ffd) > 8:
+                                        try:
+                                            frac = float(f"0.{ffd[8:]}")
+                                        except Exception:
+                                            frac = 0.0
+                                    return base + _pd.to_timedelta(frac * 86400.0, unit="s")
                         except Exception:
                             pass
                         return _pd.NaT
 
-                    ssel["obs_date"] = ssel.get("image_path").map(_parse_obs_from_fname)
-                    # prefer magnitudes if available, otherwise use SNR as fallback
-                    ssel["mag"] = _pd.to_numeric(ssel.get("mag"), errors="coerce")
-                    ssel["upper_limit"] = _pd.to_numeric(ssel.get("upper_limit"), errors="coerce")
-                    ssel["snr"] = _pd.to_numeric(ssel.get("snr"), errors="coerce")
+                    ssel["obs_datetime"] = ssel.get("image_path").apply(_extract_obs_datetime)
 
-                    # Determine trigger time for relative-phase plotting
-                    trigger_date = None
-                    if "phase" in ssel.columns and (ssel[ssel["phase"] == "posttrigger"]["obs_date"].notna().any()):
-                        trigger_date = ssel[ssel["phase"] == "posttrigger"]["obs_date"].min()
-                    # fallback: use earliest posttrigger mag if available
-                    if trigger_date is None and ssel[ssel["mag"].notna()]["obs_date"].notna().any():
-                        trigger_date = ssel[ssel["mag"].notna()]["obs_date"].min()
-                    if trigger_date is None and ssel["obs_date"].notna().any():
-                        trigger_date = ssel["obs_date"].min()
+                    # For any rows missing precise datetime, fall back to the date parsed from the label
+                    mask_na = ssel["obs_datetime"].isna()
+                    if mask_na.any():
+                        ssel.loc[mask_na, "obs_datetime"] = ssel.loc[mask_na, "date_label"].apply(lambda dl: _pd.to_datetime(dl[:10], errors="coerce") if isinstance(dl, str) else _pd.NaT)
 
-                    # compute relative days (float) and human-friendly labels
-                    if pd.notna(trigger_date):
-                        ssel = ssel[ssel["obs_date"].notna()].copy()
-                        ssel["delta_days"] = (ssel["obs_date"] - trigger_date).dt.total_seconds() / 86400.0
+                    # Extract filter from filename (more robust than regex on date_label)
+                    def _extract_filter(pth):
+                        try:
+                            parsed = parse_diff_name(Path(str(pth)).name)
+                            if parsed:
+                                return parsed.get("filter")
+                        except Exception:
+                            pass
+                        return None
 
-                        def _day_hour_label(days_float):
-                            sign = "+" if days_float >= 0 else "-"
-                            total_seconds = abs(int(round(days_float * 86400)))
-                            d = total_seconds // 86400
-                            h = (total_seconds % 86400) // 3600
-                            return f"{sign}{d}d {h}h"
+                    ssel["filt"] = ssel.get("image_path").apply(_extract_filter)
 
-                        # plotting with relative days on X axis
-                        fig = plt.figure(figsize=(7, 3))
-                        ax = fig.add_subplot(111)
+                    # plotting using real datetimes on X axis and coloring by filter
+                    filter_colors = {"zg": "green", "zr": "red", "zi": "orange"}
+                    ssel_plot = ssel[ssel["obs_datetime"].notna()].copy()
+                    if not ssel_plot.empty:
+                        import matplotlib.dates as mdates
+                        from matplotlib.dates import DateFormatter
 
-                        # plot detections (magnitudes) if present
-                        if ssel["mag"].notna().any():
-                            det = ssel[ssel["mag"].notna()]
-                            ax.errorbar(det["delta_days"], det["mag"], yerr=det.get("mag_err"), fmt="o", label="mag")
-                            # upper limits (non-detections)
-                            ul = ssel[ssel["mag"].isna() & ssel["upper_limit"].notna()]
-                            if not ul.empty:
-                                ax.scatter(ul["delta_days"], ul["upper_limit"], marker="v", color="gray", label="upper limit")
-                            ax.invert_yaxis()
-                            ax.set_ylabel("mag (lower = brighter)")
-                        else:
-                            # fallback to SNR vs relative time
-                            ax.plot(ssel["delta_days"], ssel["snr"], marker="o")
-                            ax.set_ylabel("SNR")
+                        fig, ax = plt.subplots(figsize=(9, 4))
+                        for filt, color in filter_colors.items():
+                            mask_f = ssel_plot["filt"] == filt
+                            if mask_f.any() and ssel_plot.loc[mask_f, "mag"].notna().any():
+                                det = ssel_plot[mask_f & ssel_plot["mag"].notna()]
+                                ax.errorbar(det["obs_datetime"].values, det["mag"].values, yerr=det.get("mag_err"), fmt="o", color=color, label=f"Det ({filt})")
+                            if mask_f.any() and ssel_plot.loc[mask_f, "upper_limit"].notna().any():
+                                ul = ssel_plot[mask_f & ssel_plot["upper_limit"].notna()]
+                                ax.scatter(ul["obs_datetime"].values, ul["upper_limit"].values, marker="v", color=color, s=60, alpha=0.6, label=f"UL ({filt})")
 
-                        # format ticks: choose up to 8 ticks across span
-                        span = ssel["delta_days"].max() - ssel["delta_days"].min() if len(ssel) > 1 else 1.0
-                        if span <= 0:
-                            ticks = sorted(ssel["delta_days"].unique())
-                        else:
-                            nticks = min(8, max(3, int(span) + 3))
-                            ticks = list(_np.linspace(ssel["delta_days"].min(), ssel["delta_days"].max(), nticks))
-                        ax.set_xticks(ticks)
-                        ax.set_xticklabels([_day_hour_label(t) for t in ticks])
-                        ax.set_xlabel("time since trigger")
+                        # xticks: use a date locator/formatter so labels do not overlap
+                        import matplotlib.dates as mdates
+                        from matplotlib.dates import DateFormatter
+
+                        locator = mdates.AutoDateLocator()
+                        # choose formatter depending on whether times are non-midnight
+                        unique_dt = sorted(ssel_plot["obs_datetime"].dropna().unique())
+                        times_present = any((dt.time().hour != 0 or dt.time().minute != 0 or dt.time().second != 0) for dt in unique_dt)
+                        fmt = DateFormatter('%Y-%m-%d %H:%M:%S') if times_present else DateFormatter('%Y-%m-%d')
+                        ax.xaxis.set_major_locator(locator)
+                        ax.xaxis.set_major_formatter(fmt)
+                        fig.autofmt_xdate(rotation=45, ha='right')
+
+                        ax.invert_yaxis()
+                        ax.set_ylabel("mag")
                         ax.set_title(f"Light curve {oid}")
-                        ax.legend(loc="best")
+                        ax.legend()
                         plt.tight_layout()
-                        plt.savefig(obj_dir / "lightcurve_mag.png", bbox_inches="tight")
-                        plt.close(fig)
-                    else:
-                        # fallback: previous behavior without relative labels
-                        fig = plt.figure(figsize=(6, 3))
-                        if ssel["obs_date"].notna().any():
-                            ssel = ssel.sort_values("obs_date")
-                            if ssel["mag"].notna().any():
-                                ds = ssel[ssel["mag"].notna()]
-                                plt.plot(ds["obs_date"], ds["mag"], marker="o", linestyle="-", label="mag")
-                                ul = ssel[ssel["upper_limit"].notna()]
-                                if not ul.empty:
-                                    plt.scatter(ul["obs_date"], ul["upper_limit"], marker="v", color="gray", label="upper limit")
-                                plt.gca().invert_yaxis()
-                                plt.ylabel("mag (lower=brighter)")
-                            else:
-                                plt.plot(ssel["obs_date"], ssel["snr"], marker="o")
-                                plt.ylabel("SNR")
-                            plt.gcf().autofmt_xdate()
-                        else:
-                            if ssel["mag"].notna().any():
-                                plt.plot(ssel.index, ssel["mag"], marker="o")
-                                plt.gca().invert_yaxis()
-                                plt.ylabel("mag")
-                            else:
-                                plt.plot(ssel.index, ssel["snr"], marker="o")
-                                plt.ylabel("SNR")
-                                plt.xlabel("index")
-                        plt.title(f"Light curve {oid}")
+                        plt.grid(True, alpha=0.3)
                         plt.savefig(obj_dir / "lightcurve_mag.png", bbox_inches="tight")
                         plt.close(fig)
             except Exception:

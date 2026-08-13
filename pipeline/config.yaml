@@ -2,7 +2,6 @@
 trigger_date: "2022-02-19"
 lookback_days: 10
 snr_threshold: 3.0
-snr_method: daostarfinder
 braai_threshold: 0.25
 host_rmag_threshold: 22.5
 sigma: 3.0
