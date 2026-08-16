@@ -157,6 +157,36 @@ def parse_diff_name(name: str):
     }
 
 
+def _parse_filefracday_datetime(filefracday: str | None):
+    """Parse the ZTF filefracday token as YYYYMMDD plus fractional day.
+
+    Examples: 20220219 -> 2022-02-19 00:00:00
+              20220219536262 -> 2022-02-19 12:52:13.036800
+    """
+    if filefracday is None:
+        return pd.NaT
+    ffd = str(filefracday).strip()
+    if not ffd:
+        return pd.NaT
+    if len(ffd) < 8:
+        return pd.NaT
+
+    base = pd.to_datetime(ffd[:8], errors="coerce", format="%Y%m%d")
+    if pd.isna(base):
+        return pd.NaT
+
+    frac_text = ffd[8:]
+    if not frac_text:
+        return base
+    if frac_text.isdigit():
+        try:
+            frac = float(f"0.{frac_text}")
+            return base + pd.to_timedelta(frac * 86400.0, unit="s")
+        except Exception:
+            pass
+    return base
+
+
 def resolve_cli_path(path_value: str | Path) -> Path:
     path = Path(path_value)
     if path.is_absolute():
@@ -267,14 +297,20 @@ def _measure_diff_magnitude(image_path: Path, *, sigma: float, maxiters: int, mi
     zero_point = _extract_zero_point(header)
     net_flux = float(phot.get("net_flux", np.nan))
     flux_err = float(phot.get("flux_err", np.nan))
+    snr = float(phot.get("snr", np.nan))
 
+    # Compute magnitude if possible. Use the provided `sigma` threshold
+    # to decide whether a measurement is a real detection. Previously the
+    # code treated any positive net_flux as a detection which can mark
+    # low-SNR noise fluctuations as real — instead require snr >= sigma.
     if np.isfinite(zero_point) and np.isfinite(net_flux) and net_flux > 0:
         mag = float(zero_point - 2.5 * np.log10(net_flux))
         mag_err = float(1.0857362047581294 * flux_err / net_flux) if np.isfinite(flux_err) and flux_err > 0 else np.nan
         upper_limit = np.nan
-        detection = True
+        detection = bool(np.isfinite(snr) and snr >= float(sigma))
     elif np.isfinite(zero_point) and np.isfinite(flux_err) and flux_err > 0:
-        upper_flux = 3.0 * flux_err
+        # no positive flux — compute an upper limit using the requested sigma
+        upper_flux = float(sigma) * flux_err
         mag = np.nan
         mag_err = np.nan
         upper_limit = float(zero_point - 2.5 * np.log10(max(upper_flux, 1e-12)))
@@ -840,14 +876,7 @@ def stage3_pretrigger_magnitude(
         parsed = parse_diff_name(Path(image_path).name)
         if parsed is None:
             return pd.NaT
-        filefracday = str(parsed.get("filefracday", ""))
-        if len(filefracday) >= 14:
-            ts = pd.to_datetime(filefracday[:14], errors="coerce", format="%Y%m%d%H%M%S")
-            if pd.notna(ts):
-                return ts
-        if len(filefracday) >= 8:
-            return pd.to_datetime(filefracday[:8], errors="coerce", format="%Y%m%d")
-        return pd.NaT
+        return _parse_filefracday_datetime(parsed.get("filefracday"))
 
     work["obs_date"] = work["image_path"].map(_parse_obs_date)
 
@@ -1102,38 +1131,31 @@ def stage3_pretrigger_magnitude(
 
         pre_mags = [float(item["mag"]) for item in pre_records if np.isfinite(item.get("mag", np.nan))]
         pre_upper_limits = [float(item["upper_limit"]) for item in pre_records if np.isfinite(item.get("upper_limit", np.nan))]
+        pre_ref = float(np.nanmedian(pre_mags)) if pre_mags else np.nan
 
         post_ref_mag = float(np.nanmedian(post_mags)) if post_mags else np.nan
         post_ref_err = float(np.nanmedian(post_mag_errs)) if post_mag_errs else np.nan
 
-        # Determine consistency and pass
+        # Determine pass/fail: require that there are pre-trigger images and none show a detection.
         n_pre = len(group)
         if n_pre == 0:
+            # No pre-trigger images -> cannot confirm transient is caused by trigger
             consistent = False
-            pass_flag = True
+            pass_flag = False
             reason = "no_pretrigger_images"
-        elif pre_mags:
-            pre_ref = float(np.nanmedian(pre_mags))
-            if np.isfinite(post_ref_mag):
-                combined_err = np.sqrt(max(post_ref_err, 0.0) ** 2 + np.nanstd(pre_mags) ** 2)
-                if not np.isfinite(combined_err) or combined_err <= 0:
-                    combined_err = 0.5
-                brightening = pre_ref - post_ref_mag
-                consistent = brightening <= max(0.5, 2.0 * combined_err)
-            else:
-                consistent = False
-            pass_flag = not consistent
-            reason = "consistent" if consistent else "pretrigger_detection"
         else:
-            if post_mags and pre_upper_limits:
-                tightest_ul = float(np.nanmax(pre_upper_limits))
-                pass_flag = bool(np.isfinite(post_ref_mag) and tightest_ul >= post_ref_mag)
-                reason = "upper_limits_allow_transient" if pass_flag else "upper_limit_too_bright"
-                consistent = pass_flag
-            else:
+            # Check whether any pre-trigger record had a detection
+            pre_detections = [r for r in pre_records if bool(r.get("detection")) and np.isfinite(r.get("mag", np.nan))]
+            if pre_detections:
+                # There was at least one detection before the trigger -> fail
                 consistent = False
                 pass_flag = False
-                reason = "no_upper_limits"
+                reason = "pretrigger_detection"
+            else:
+                # No detections pre-trigger -> pass
+                consistent = True
+                pass_flag = True
+                reason = "no_pretrigger_detections"
 
         sx, sy = source_center_lookup.get(object_id, (np.nan, np.nan))
         # detection RA/DEC: prefer coord_lookup, else use median from work
@@ -1494,21 +1516,9 @@ def save_stage4_results(final_candidates: pd.DataFrame, final_class_df: pd.DataF
                             name = Path(str(pth)).name
                             parsed = parse_diff_name(name)
                             if parsed and parsed.get("filefracday"):
-                                ffd = str(parsed["filefracday"]).strip()
-                                if len(ffd) >= 14:
-                                    dt = _pd.to_datetime(ffd[:14], format="%Y%m%d%H%M%S", errors="coerce")
-                                    if pd.notna(dt):
-                                        return float(dt.dayofyear) + (dt.hour * 3600 + dt.minute * 60 + dt.second) / 86400.0
-                                if len(ffd) >= 8:
-                                    date = _pd.to_datetime(ffd[:8], format="%Y%m%d", errors="coerce")
-                                    if pd.notna(date):
-                                        frac = 0.0
-                                        if len(ffd) > 8:
-                                            try:
-                                                frac = float(f"0.{ffd[8:]}")
-                                            except Exception:
-                                                frac = 0.0
-                                        return float(date.dayofyear) + frac
+                                dt = _parse_filefracday_datetime(parsed["filefracday"])
+                                if pd.notna(dt):
+                                    return float(dt.dayofyear) + (dt.hour * 3600 + dt.minute * 60 + dt.second + dt.microsecond / 1e6) / 86400.0
                         except Exception:
                             pass
                         return _np.nan
@@ -1537,22 +1547,7 @@ def save_stage4_results(final_candidates: pd.DataFrame, final_class_df: pd.DataF
                             name = Path(str(pth)).name
                             parsed = parse_diff_name(name)
                             if parsed and parsed.get("filefracday"):
-                                ffd = str(parsed["filefracday"]).strip()
-                                if len(ffd) >= 14:
-                                    dt = _pd.to_datetime(ffd[:14], format="%Y%m%d%H%M%S", errors="coerce")
-                                    if pd.notna(dt):
-                                        return dt
-                                if len(ffd) >= 8:
-                                    base = _pd.to_datetime(ffd[:8], format="%Y%m%d", errors="coerce")
-                                    if pd.isna(base):
-                                        return _pd.NaT
-                                    frac = 0.0
-                                    if len(ffd) > 8:
-                                        try:
-                                            frac = float(f"0.{ffd[8:]}")
-                                        except Exception:
-                                            frac = 0.0
-                                    return base + _pd.to_timedelta(frac * 86400.0, unit="s")
+                                return _parse_filefracday_datetime(parsed["filefracday"])
                         except Exception:
                             pass
                         return _pd.NaT
