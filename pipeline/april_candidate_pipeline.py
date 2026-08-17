@@ -25,7 +25,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from braai_batch import build_triplet_batch, load_braai_model, predict_braai_batch
 from ztf_downloads.fetch_sci_ref_for_snr import _build_exact_coord_index, choose_ref_row, compute_host_offset
-from ztf_downloads.snr_photometry import aperture_from_min_apcor, first_2d_data_and_header, parse_image_name, run_aperture_photometry_photutils
 from ztf_downloads.snr_photometry_quadratic import process_difference_image, process_difference_images
 from ztf_downloads.ztf_download import build_cutout_url, build_sci_url, build_ref_url, download_file
 
@@ -103,6 +102,30 @@ def _extract_object_id(value) -> str:
         return ""
     match = re.search(r"(\d{8,})", text)
     return match.group(1) if match else text
+
+
+def _ensure_object_id_column(df: pd.DataFrame | None) -> pd.DataFrame:
+    """Return a catalog with a normalized object_id column.
+
+    Some input CSVs (for example the raw final-class table) do not have an explicit
+    object_id column. In that case, synthesize one from the best available ID field;
+    if none exists, fall back to the row number as a stable surrogate identifier.
+    """
+    if df is None:
+        return pd.DataFrame()
+    work = df.copy()
+    if "object_id" in work.columns:
+        work["object_id"] = work["object_id"].astype(str).map(normalize_object_id)
+        return work
+
+    for candidate in ("objid", "objID", "ID", "id", "objectid"):
+        if candidate in work.columns:
+            work["object_id"] = work[candidate].map(_extract_object_id)
+            work["object_id"] = work["object_id"].astype(str).map(normalize_object_id)
+            return work
+
+    work.insert(0, "object_id", [str(i + 1) for i in range(len(work))])
+    return work
 
 
 def _build_final_rownum_map(final_class_df: pd.DataFrame) -> dict:
@@ -274,69 +297,6 @@ def _extract_zero_point(header: dict) -> float:
         if np.isfinite(value):
             return float(value)
     return np.nan
-
-
-def _measure_diff_magnitude(image_path: Path, *, sigma: float, maxiters: int, min_valid_pixel: float) -> dict:
-    from astropy.stats import sigma_clipped_stats
-
-    data, header = first_2d_data_and_header(image_path)
-    info = parse_image_name(Path(image_path).name)
-    ny, nx = data.shape
-    cx = (nx - 1) / 2.0
-    cy = (ny - 1) / 2.0
-
-    try:
-        ap_r, apcor_key, apcor_val, ap_diam_px = aperture_from_min_apcor(header)
-    except Exception:
-        ap_r = 2.0
-        apcor_key = ""
-        apcor_val = np.nan
-        ap_diam_px = np.nan
-
-    phot = run_aperture_photometry_photutils(data, cx, cy, ap_r)
-    zero_point = _extract_zero_point(header)
-    net_flux = float(phot.get("net_flux", np.nan))
-    flux_err = float(phot.get("flux_err", np.nan))
-    snr = float(phot.get("snr", np.nan))
-
-    # Compute magnitude if possible. Use the provided `sigma` threshold
-    # to decide whether a measurement is a real detection. Previously the
-    # code treated any positive net_flux as a detection which can mark
-    # low-SNR noise fluctuations as real — instead require snr >= sigma.
-    if np.isfinite(zero_point) and np.isfinite(net_flux) and net_flux > 0:
-        mag = float(zero_point - 2.5 * np.log10(net_flux))
-        mag_err = float(1.0857362047581294 * flux_err / net_flux) if np.isfinite(flux_err) and flux_err > 0 else np.nan
-        upper_limit = np.nan
-        detection = bool(np.isfinite(snr) and snr >= float(sigma))
-    elif np.isfinite(zero_point) and np.isfinite(flux_err) and flux_err > 0:
-        # no positive flux — compute an upper limit using the requested sigma
-        upper_flux = float(sigma) * flux_err
-        mag = np.nan
-        mag_err = np.nan
-        upper_limit = float(zero_point - 2.5 * np.log10(max(upper_flux, 1e-12)))
-        detection = False
-    else:
-        mag = np.nan
-        mag_err = np.nan
-        upper_limit = np.nan
-        detection = False
-
-    return {
-        "image_path": str(image_path),
-        "object_id": info["object_id"] if info else "",
-        "ra": info["ra"] if info else np.nan,
-        "dec": info["dec"] if info else np.nan,
-        "mag": mag,
-        "mag_err": mag_err,
-        "upper_limit": upper_limit,
-        "detection": detection,
-        "zero_point": zero_point,
-        "aperture_radius_px": ap_r,
-        "apcor_min_key": apcor_key,
-        "apcor_min_value": apcor_val,
-        "apcor_min_diameter_px": ap_diam_px,
-        **phot,
-    }
 
 
 def _center_crop(data: np.ndarray, size: int) -> np.ndarray:
@@ -838,6 +798,7 @@ def stage3_pretrigger_magnitude(
     out_dir: Path,
     trigger_date,
     lookback_days: int = 10,
+    posttrigger_days: int = 10,
     sigma: float = 3.0,
     maxiters: int = 5,
     min_valid_pixel: float = -5000.0,
@@ -865,6 +826,8 @@ def stage3_pretrigger_magnitude(
 
     trigger = pd.to_datetime(trigger_date)
     window_start = trigger - pd.Timedelta(days=int(lookback_days))
+    posttrigger_window_start = trigger + pd.Timedelta(days=2)
+    posttrigger_window_end = trigger + pd.Timedelta(days=int(posttrigger_days))
 
     # Prepare diff_index with object_id and obs_date
     work = diff_index.copy()
@@ -927,8 +890,11 @@ def stage3_pretrigger_magnitude(
         final_class_df = None
     final_rownum_map = _build_final_rownum_map(final_class_df)
 
-    # Identify objects that need pre-trigger downloads
+    # Identify objects that need pre-trigger downloads and post-trigger downloads.
+    # The first two days after trigger are assumed to already be available; the next
+    # `posttrigger_days` days are downloaded here before the light-curve analysis.
     download_needed = {}
+    download_post_needed = {}
     if download_missing:
         for obj in object_ids:
             obj_work = work[work["object_id"] == obj]
@@ -936,28 +902,39 @@ def stage3_pretrigger_magnitude(
             if len(pre) == 0:
                 download_needed[obj] = True
 
-    if download_needed:
-        logging.info(f"Downloading pre-trigger images for {len(download_needed)} objects")
+            post = obj_work[(obj_work["obs_date"] >= posttrigger_window_start) & (obj_work["obs_date"] <= posttrigger_window_end)]
+            if len(post) == 0:
+                download_post_needed[obj] = True
+
+    if download_needed or download_post_needed:
+        logging.info(
+            "Downloading missing pre/post-trigger images for %s objects (%s pre, %s post)",
+            len(set(list(download_needed.keys()) + list(download_post_needed.keys()))),
+            len(download_needed),
+            len(download_post_needed),
+        )
         download_inputs = []
-        for obj in download_needed:
+        for obj in set(list(download_needed.keys()) + list(download_post_needed.keys())):
             if obj not in coord_lookup:
                 logging.warning(f"Could not find coordinates for object {obj}")
                 continue
             ra, dec = coord_lookup[obj]
 
-            # Search metadata – only r‑band
-            # prefer row number for filenames if available
             obj_norm = normalize_object_id(obj)
             rownum = final_rownum_map.get(obj_norm, obj_norm)
             search_csv = out_dir / f"pretrigger_search_{rownum}.csv"
             search_progress = out_dir / f"pretrigger_search_{rownum}.progress.json"
-            # Robust metadata fetch: try normal batch, then longer timeout/retries,
-            # then fall back to per-day queries if IRSA is timing out or returning
-            # transient errors.
             from ztf_downloads.ztf_search import metadata_search_batch
 
+            date_start = window_start.strftime("%Y-%m-%d")
+            date_end = trigger.strftime("%Y-%m-%d")
+            if obj in download_post_needed:
+                date_start = posttrigger_window_start.strftime("%Y-%m-%d")
+                date_end = posttrigger_window_end.strftime("%Y-%m-%d")
+                search_csv = out_dir / f"posttrigger_search_{rownum}.csv"
+                search_progress = out_dir / f"posttrigger_search_{rownum}.progress.json"
+
             def _fetch_meta():
-                # primary attempt: short timeout
                 try:
                     return metadata_search_resumable(
                         positions=[(ra, dec)],
@@ -967,13 +944,12 @@ def stage3_pretrigger_magnitude(
                         size_deg=0.01,
                         product_type="sci",
                         filtercodes=["zr"],
-                        date_start=window_start.strftime("%Y-%m-%d"),
-                        date_end=trigger.strftime("%Y-%m-%d"),
+                        date_start=date_start,
+                        date_end=date_end,
                         timeout=120,
                     )
                 except Exception as e1:
                     logging.warning(f"Metadata search initial attempt failed for {obj}: {e1}")
-                # Second attempt: longer timeout and more retries
                 try:
                     return metadata_search_resumable(
                         positions=[(ra, dec)],
@@ -983,22 +959,20 @@ def stage3_pretrigger_magnitude(
                         size_deg=0.01,
                         product_type="sci",
                         filtercodes=["zr"],
-                        date_start=window_start.strftime("%Y-%m-%d"),
-                        date_end=trigger.strftime("%Y-%m-%d"),
+                        date_start=date_start,
+                        date_end=date_end,
                         timeout=300,
                         max_retries=8,
                     )
                 except Exception as e2:
                     logging.warning(f"Metadata search extended attempt failed for {obj}: {e2}")
 
-                # Final fallback: split date range into per-day POST queries to reduce server load
                 try:
                     parts = []
-                    # iterate day-by-day
-                    day_start = pd.to_datetime(window_start).normalize()
-                    day_end = pd.to_datetime(trigger).normalize()
+                    day_start = pd.to_datetime(date_start).normalize()
+                    day_end_dt = pd.to_datetime(date_end).normalize()
                     cur = day_start
-                    while cur < day_end:
+                    while cur < day_end_dt:
                         ds = cur.strftime("%Y-%m-%d")
                         de = (cur + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
                         try:
@@ -1014,7 +988,6 @@ def stage3_pretrigger_magnitude(
                 except Exception as e4:
                     logging.warning(f"Per-day fallback failed for {obj}: {e4}")
 
-                # all attempts failed
                 return pd.DataFrame()
 
             df_meta = _fetch_meta()
@@ -1022,70 +995,47 @@ def stage3_pretrigger_magnitude(
                 logging.warning(f"Metadata search yielded no results for {obj}")
                 continue
 
-            if df_meta is None or df_meta.empty:
-                continue
-
             for _, mrow in df_meta.iterrows():
-                field = mrow.get("field", 0)
-                ccdid = mrow.get("ccdid", 0)
-                qid = mrow.get("qid", 0)
-                filtercode = mrow.get("filtercode", "")
                 filefracday = mrow.get("filefracday", "")
-                obj_norm = normalize_object_id(obj)
+                obs_dt = _parse_filefracday_datetime(str(filefracday))
+                if pd.isna(obs_dt):
+                    continue
+                if obs_dt < trigger and obj in download_needed:
+                    continue
+                if obs_dt < posttrigger_window_start and obj in download_post_needed:
+                    continue
+                if obs_dt > posttrigger_window_end and obj in download_post_needed:
+                    continue
+                if obj in download_needed and obs_dt >= trigger:
+                    continue
 
-                # 1. Get the correct science image URL using the existing function
                 base_sci_url = build_sci_url(mrow, suffix="scimrefdiffimg.fits.fz")
-                
-                # 2. Extract the original filename from that URL
                 original_fname = Path(urlparse(base_sci_url).path).name
-                
-                # 3. Create cutout URL (adds center, size, gzip)
                 url = build_cutout_url(base_sci_url, float(mrow["in_ra"]), float(mrow["in_dec"]), size_arcsec=240)
-                
-                # 4. Get the full 14‑digit filefracday as string (ensure no truncation)
                 filefracday_str = str(int(mrow["filefracday"])).zfill(14)
-                
-                # 5. Your custom label
                 custom_label = f"RA{mrow['in_ra']:.4f}_DEC{mrow['in_dec']:.4f}_{mrow['filtercode']}_{filefracday_str}"
-
                 row_label = final_rownum_map.get(obj_norm, obj_norm)
-                
-                # 6. Desired final filename: gal_folder + custom_label + "__" + original_fname
                 desired_fname = f"{str(row_label)}_{custom_label}__{original_fname}"
-                
                 download_inputs.append((url, desired_fname, str(row_label)))
 
-                # file_label = (
-                #     f"{row_label}_RA{ra:.4f}_DEC{dec:.4f}_{filtercode}_{filefracday}__ztf_{int(field):06d}_{filtercode}_c{int(ccdid)}_o_q{int(qid)}_scimrefdiffimg"
-                # )
-                # url = build_cutout_url(
-                #     build_sci_url(mrow, suffix="scimrefdiffimg.fits.fz"),
-                #     float(mrow['in_ra']),
-                #     float(mrow['in_dec']),
-                #     size_arcsec=240,
-                # )
-                # download_inputs.append((url, file_label, str(row_label)))
-
         if download_inputs:
-            logging.info(f"Downloading {len(download_inputs)} pre-trigger cutouts")
+            logging.info(f"Downloading {len(download_inputs)} missing time-window cutouts")
             batch_download_resumable(
                 download_inputs,
                 out_dir=str(diff_root),
-                progress_json=str(out_dir / "pretrigger_download.progress.json"),
+                progress_json=str(out_dir / "time_window_download.progress.json"),
                 max_workers=6,
                 chunk_size=100,
             )
-            # Re-index diff_root to include newly downloaded files
             diff_index = collect_diff_index(diff_root)
             work = diff_index.copy()
-            # IMPORTANT: normalize object_id to avoid scientific notation
             work["object_id"] = work["object_id"].map(normalize_object_id)
             work["obs_date"] = work["image_path"].map(_parse_obs_date)
 
 
     # Now separate pre and post trigger
     pretrigger = work[(work["obs_date"] < trigger) & (work["obs_date"] >= window_start)].copy()
-    posttrigger = work[work["obs_date"] >= trigger].copy()
+    posttrigger = work[(work["obs_date"] >= trigger) & (work["obs_date"] <= posttrigger_window_end)].copy()
 
     image_rows = []
     object_rows = []
@@ -1101,17 +1051,18 @@ def stage3_pretrigger_magnitude(
             if not path.exists():
                 continue
             try:
-                record = _measure_diff_magnitude(path, sigma=sigma, maxiters=maxiters, min_valid_pixel=min_valid_pixel)
+                record = process_difference_image(path, sigma=sigma, maxiters=maxiters, min_valid_pixel=min_valid_pixel)
+                record_dict = record.__dict__.copy()
             except Exception as exc:
                 image_rows.append({"object_id": object_id, "image_path": str(path), "status": f"error: {exc}"})
                 continue
             sx, sy = source_center_lookup.get(object_id, (np.nan, np.nan))
-            record.update({"object_id": object_id, "phase": "posttrigger", "source_x_px": sx, "source_y_px": sy})
-            image_rows.append(record)
-            if np.isfinite(record.get("mag", np.nan)):
-                post_mags.append(float(record["mag"]))
-                if np.isfinite(record.get("mag_err", np.nan)):
-                    post_mag_errs.append(float(record["mag_err"]))
+            record_dict.update({"object_id": object_id, "phase": "posttrigger", "source_x_px": sx, "source_y_px": sy})
+            image_rows.append(record_dict)
+            if np.isfinite(record_dict.get("mag", np.nan)):
+                post_mags.append(float(record_dict["mag"]))
+                if np.isfinite(record_dict.get("mag_err", np.nan)):
+                    post_mag_errs.append(float(record_dict["mag_err"]))
 
         # Measure pre-trigger magnitudes
         pre_records = []
@@ -1120,14 +1071,15 @@ def stage3_pretrigger_magnitude(
             if not path.exists():
                 continue
             try:
-                record = _measure_diff_magnitude(path, sigma=sigma, maxiters=maxiters, min_valid_pixel=min_valid_pixel)
+                record = process_difference_image(path, sigma=sigma, maxiters=maxiters, min_valid_pixel=min_valid_pixel)
+                record_dict = record.__dict__.copy()
             except Exception as exc:
                 image_rows.append({"object_id": object_id, "image_path": str(path), "status": f"error: {exc}"})
                 continue
             sx, sy = source_center_lookup.get(object_id, (np.nan, np.nan))
-            record.update({"object_id": object_id, "phase": "pretrigger", "source_x_px": sx, "source_y_px": sy})
-            image_rows.append(record)
-            pre_records.append(record)
+            record_dict.update({"object_id": object_id, "phase": "pretrigger", "source_x_px": sx, "source_y_px": sy})
+            image_rows.append(record_dict)
+            pre_records.append(record_dict)
 
         pre_mags = [float(item["mag"]) for item in pre_records if np.isfinite(item.get("mag", np.nan))]
         pre_upper_limits = [float(item["upper_limit"]) for item in pre_records if np.isfinite(item.get("upper_limit", np.nan))]
@@ -1196,6 +1148,8 @@ def stage3_pretrigger_magnitude(
     return mag_df, stage3_objects_all, stage3_objects_pass
 
 def stage4_host_mag(stage3_objects: pd.DataFrame, final_class_df: pd.DataFrame, out_root: Path, *, host_rmag_threshold: float, resume: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
+    final_class_df = _ensure_object_id_column(final_class_df)
+
     stage4_dir = ensure_dir(out_root / "stage4")
     host_objects_path = stage4_dir / "april_stage4_hostmag_objects.csv"
     final_candidates_path = stage4_dir / "april_stage4_final_candidates.csv"
@@ -1582,7 +1536,7 @@ def save_stage4_results(final_candidates: pd.DataFrame, final_class_df: pd.DataF
                         for filt, color in filter_colors.items():
                             mask_f = ssel_plot["filt"] == filt
                             if mask_f.any() and ssel_plot.loc[mask_f, "mag"].notna().any():
-                                det = ssel_plot[mask_f & ssel_plot["mag"].notna()]
+                                det = ssel_plot[mask_f & ssel_plot["mag"].notna() & (ssel_plot["snr"] >= 3)]
                                 ax.errorbar(det["obs_datetime"].values, det["mag"].values, yerr=det.get("mag_err"), fmt="o", color=color, label=f"Det ({filt})")
                             if mask_f.any() and ssel_plot.loc[mask_f, "upper_limit"].notna().any():
                                 ul = ssel_plot[mask_f & ssel_plot["upper_limit"].notna()]
@@ -1697,6 +1651,7 @@ def main(argv: list[str] | None = None) -> int:
         out_dir=out_root / "stage3",
         trigger_date=str(config.get("trigger_date", "2019-04-25")),
         lookback_days=int(config.get("lookback_days", 10)),
+        posttrigger_days=int(config.get("posttrigger_days", 10)),
         sigma=float(config.get("sigma", 3.0)),
         maxiters=int(config.get("maxiters", 5)),
         min_valid_pixel=float(config.get("min_valid_pixel", -5000.0)),

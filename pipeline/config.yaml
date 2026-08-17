@@ -1,6 +1,7 @@
 # Pipeline configuration
 trigger_date: "2022-02-19"
 lookback_days: 10
+posttrigger_days: 10
 snr_threshold: 3.0
 braai_threshold: 0.25
 host_rmag_threshold: 22.5
