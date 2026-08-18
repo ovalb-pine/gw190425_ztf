@@ -7,7 +7,7 @@ braai_threshold: 0.25
 host_rmag_threshold: 22.5
 sigma: 3.0
 maxiters: 5
-min_valid_pixel: -5000.0
+min_valid_pixel: -4000.0
 max_ref_sep_arcsec: 3.0
 triplet_size: 63
 ref_flip_lr: true

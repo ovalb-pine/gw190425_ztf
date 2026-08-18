@@ -1295,7 +1295,14 @@ def stage4_host_rmag(*, stage3_objects: pd.DataFrame, final_class_path: Path, ou
     return enriched_df, final_df
 
 
-def save_stage4_results(final_candidates: pd.DataFrame, final_class_df: pd.DataFrame, out_root: Path, *, max_triplets_per_object: int = 10):
+def save_stage4_results(
+    final_candidates: pd.DataFrame,
+    final_class_df: pd.DataFrame,
+    out_root: Path,
+    *,
+    max_triplets_per_object: int = 10,
+    trigger_datetime=None,
+):
     """Save normalized triplet plots, 1D/3D profiles and SNR light curves for each final candidate.
 
     Files are written under `out_root/stage4/results/<row_or_object_id>/`.
@@ -1399,7 +1406,7 @@ def save_stage4_results(final_candidates: pd.DataFrame, final_class_df: pd.DataF
                     ax2.axis("off")
 
                 fig.colorbar(im, ax=axes.ravel().tolist(), orientation="horizontal", fraction=0.05)
-                fig.savefig(obj_dir / f"triplet_norm_{i}.png", dpi=150, bbox_inches="tight")
+                fig.savefig(obj_dir / f"triplet_norm_{i}.png", dpi=400, bbox_inches="tight")
                 plt.close(fig)
             except Exception:
                 logging.debug("failed to save triplet image for %s: %s", oid, tpath)
@@ -1419,7 +1426,7 @@ def save_stage4_results(final_candidates: pd.DataFrame, final_class_df: pd.DataF
                 plt.plot(radial, marker=".")
                 plt.xlabel("radius (px)")
                 plt.ylabel("mean normalized diff")
-                plt.savefig(obj_dir / f"radial_profile_{i}.png", bbox_inches="tight")
+                plt.savefig(obj_dir / f"radial_profile_{i}.png", bbox_inches="tight", dpi=400)
                 plt.close(fig)
             except Exception:
                 logging.debug("failed radial profile for %s", oid)
@@ -1433,7 +1440,7 @@ def save_stage4_results(final_candidates: pd.DataFrame, final_class_df: pd.DataF
                 X, Y = _np.meshgrid(xs, ys)
                 ax.plot_surface(X, Y, diff, cmap="viridis", linewidth=0, antialiased=False)
                 ax.set_zlim(_np.nanpercentile(diff, 5), _np.nanpercentile(diff, 95))
-                plt.savefig(obj_dir / f"surface_{i}.png", bbox_inches="tight")
+                plt.savefig(obj_dir / f"surface_{i}.png", bbox_inches="tight", dpi=400)
                 plt.close(fig)
             except Exception:
                 logging.debug("failed 3d surface for %s", oid)
@@ -1537,31 +1544,32 @@ def save_stage4_results(final_candidates: pd.DataFrame, final_class_df: pd.DataF
                             mask_f = ssel_plot["filt"] == filt
                             if mask_f.any() and ssel_plot.loc[mask_f, "mag"].notna().any():
                                 det = ssel_plot[mask_f & ssel_plot["mag"].notna() & (ssel_plot["snr"] >= 3)]
-                                ax.errorbar(det["obs_datetime"].values, det["mag"].values, yerr=det.get("mag_err"), fmt="o", color=color, label=f"Det ({filt})")
+                                ax.errorbar(det["obs_datetime"].values, det["mag"].values, yerr=det.get("mag_err"), fmt="o", color=color, label=f"Обнаружение ({filt})")
                             if mask_f.any() and ssel_plot.loc[mask_f, "upper_limit"].notna().any():
                                 ul = ssel_plot[mask_f & ssel_plot["upper_limit"].notna()]
-                                ax.scatter(ul["obs_datetime"].values, ul["upper_limit"].values, marker="v", color=color, s=60, alpha=0.6, label=f"UL ({filt})")
+                                ax.scatter(ul["obs_datetime"].values, ul["upper_limit"].values, marker="v", color=color, s=60, alpha=0.6, label=f"Верхний предел ({filt})")
 
                         # xticks: use a date locator/formatter so labels do not overlap
                         import matplotlib.dates as mdates
                         from matplotlib.dates import DateFormatter
 
                         locator = mdates.AutoDateLocator()
-                        # choose formatter depending on whether times are non-midnight
-                        unique_dt = sorted(ssel_plot["obs_datetime"].dropna().unique())
-                        times_present = any((dt.time().hour != 0 or dt.time().minute != 0 or dt.time().second != 0) for dt in unique_dt)
-                        fmt = DateFormatter('%Y-%m-%d %H:%M:%S') if times_present else DateFormatter('%Y-%m-%d')
+                        # Keep explicit year-month-day labels and suppress time text.
+                        formatter = mdates.DateFormatter("%Y-%m-%d")
                         ax.xaxis.set_major_locator(locator)
-                        ax.xaxis.set_major_formatter(fmt)
+                        ax.xaxis.set_major_formatter(formatter)
                         fig.autofmt_xdate(rotation=45, ha='right')
 
+                        if trigger_datetime is not None and pd.notna(trigger_datetime):
+                            ax.axvline(pd.to_datetime(trigger_datetime), color="black", linestyle="--", linewidth=1.2, alpha=0.8, label="Триггер GRB 220219B")
+
                         ax.invert_yaxis()
-                        ax.set_ylabel("mag")
-                        ax.set_title(f"Light curve {oid}")
+                        ax.set_ylabel("Звёздная величина")
+                        ax.set_title(f"Кривая блеска {oid}")
                         ax.legend()
                         plt.tight_layout()
                         plt.grid(True, alpha=0.3)
-                        plt.savefig(obj_dir / "lightcurve_mag.png", bbox_inches="tight")
+                        plt.savefig(obj_dir / "lightcurve_mag.png", bbox_inches="tight", dpi=400)
                         plt.close(fig)
             except Exception:
                 logging.debug("failed to save light curve for %s", oid)
@@ -1578,6 +1586,16 @@ def main(argv: list[str] | None = None) -> int:
 
     config = load_config(args.config)
     resume = bool(args.resume or config.get("resume", True)) and not bool(args.force)
+
+    trigger_date_text = str(config.get("trigger_date", "2019-04-25"))
+    trigger_time_text = str(config.get("trigger_time", "")).strip()
+    trigger_datetime_text = f"{trigger_date_text} {trigger_time_text}".strip() if trigger_time_text else trigger_date_text
+    try:
+        trigger_datetime = pd.to_datetime(trigger_datetime_text)
+    except Exception:
+        logging.warning("Invalid trigger datetime in config: %s", trigger_datetime_text)
+        trigger_datetime = pd.NaT
+
     out_root = ensure_dir(resolve_cli_path(config.get("out_root", "april_candidate_pipeline_out")))
     log_path = out_root / "pipeline.log"
     logging.basicConfig(level=getattr(logging, str(config.get("log_level", "INFO")).upper(), logging.INFO), format="%(asctime)s %(levelname)s %(message)s", filename=log_path, filemode="w")
@@ -1649,7 +1667,7 @@ def main(argv: list[str] | None = None) -> int:
         diff_root=diff_root,
         final_class_path=final_class_csv,
         out_dir=out_root / "stage3",
-        trigger_date=str(config.get("trigger_date", "2019-04-25")),
+        trigger_date=trigger_date_text,
         lookback_days=int(config.get("lookback_days", 10)),
         posttrigger_days=int(config.get("posttrigger_days", 10)),
         sigma=float(config.get("sigma", 3.0)),
@@ -1669,7 +1687,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Save per-candidate results (triplets, profiles, light curves)
     try:
-        save_stage4_results(final_candidates, final_class_df, out_root)
+        save_stage4_results(final_candidates, final_class_df, out_root, trigger_datetime=trigger_datetime)
     except Exception:
         logging.exception("Failed to save stage4 results")
 
