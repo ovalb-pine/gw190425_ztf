@@ -28,16 +28,6 @@ from ztf_downloads.fetch_sci_ref_for_snr import _build_exact_coord_index, choose
 from ztf_downloads.snr_photometry_quadratic import process_difference_image, process_difference_images
 from ztf_downloads.ztf_download import build_cutout_url, build_sci_url, build_ref_url, download_file
 
-def _lookup_object_coords(final_class_df, object_id):
-    object_id = normalize_object_id(object_id)
-    rows = final_class_df[final_class_df["objID_SDSS-DR16"].map(normalize_object_id) == object_id]
-    if not rows.empty:
-        row = rows.iloc[0]
-        ra = _safe_float(row.get("ra_fin", row.get("ra_SDSS-DR16", np.nan)))
-        dec = _safe_float(row.get("dec_fin", row.get("dec_SDSS-DR16", np.nan)))
-        if np.isfinite(ra) and np.isfinite(dec):
-            return ra, dec
-    return np.nan, np.nan
 
 def load_config(config_path: str | Path = "config.yaml") -> dict:
     with Path(config_path).open("r", encoding="utf-8") as handle:
@@ -261,62 +251,67 @@ def collect_diff_index(diff_root: Path) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _load_local_image(path: Path) -> np.ndarray:
-    from astropy.io import fits
+def measure_fwhm_from_image(diff_path: Path, center_x: float, center_y: float, box_size: int = 21) -> float:
+    """
+    Measure FWHM of the detection in the difference image at the given pixel position.
 
-    with fits.open(path, memmap=False, ignore_missing_end=True) as hdul:
-        for hdu in hdul:
-            data = getattr(hdu, "data", None)
-            if isinstance(data, np.ndarray) and data.ndim == 2:
-                return np.asarray(data, dtype=float)
-    raise ValueError(f"No 2D image plane found in {path}")
+    Returns FWHM in pixels, or np.nan if the fit fails.
+    """
+    try:
+        from astropy.io import fits
+        from astropy.modeling import models, fitting
+        import numpy as np
 
+        with fits.open(diff_path, memmap=False) as hdul:
+            for hdu in hdul:
+                if hdu.data is not None and hdu.data.ndim == 2:
+                    data = np.asarray(hdu.data, dtype=float)
+                    break
+            else:
+                return np.nan
 
-def _normalize_image(data: np.ndarray) -> np.ndarray:
-    arr = np.asarray(data, dtype=np.float32)
-    finite = np.isfinite(arr)
-    if not finite.any():
-        return np.zeros_like(arr, dtype=np.float32)
-    arr = arr.copy()
-    arr[~finite] = np.nanmedian(arr[finite])
-    lo, hi = np.nanpercentile(arr, [1.0, 99.0])
-    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-        centered = arr - np.nanmedian(arr)
-        scale = np.nanstd(centered)
-        return centered / scale if np.isfinite(scale) and scale > 0 else centered
-    clipped = np.clip(arr, lo, hi)
-    return (clipped - lo) / (hi - lo)
+        # Crop region around the detection
+        half = box_size // 2
+        cy, cx = int(round(center_y)), int(round(center_x))
+        y1 = max(0, cy - half)
+        y2 = min(data.shape[0], cy + half + 1)
+        x1 = max(0, cx - half)
+        x2 = min(data.shape[1], cx + half + 1)
+        cutout = data[y1:y2, x1:x2]
 
+        if cutout.size == 0:
+            return np.nan
 
-def _extract_zero_point(header: dict) -> float:
-    for key in ("MAGZP", "MAGZERO", "ZP", "ZEROPT", "ZEROPNT"):
-        try:
-            value = float(header.get(key))
-        except Exception:
-            continue
-        if np.isfinite(value):
-            return float(value)
-    return np.nan
+        # Fit a 2D Gaussian to the cutout
+        yy, xx = np.indices(cutout.shape)
+        y_center, x_center = np.unravel_index(np.argmax(cutout), cutout.shape)
 
+        # Fit the source after subtracting a local background.  Keeping the
+        # Gaussian as a standalone model makes its fitted width available
+        # consistently across Astropy versions.
+        background = float(np.nanmedian(cutout))
+        fit_data = cutout - background
+        peak_y, peak_x = np.unravel_index(np.nanargmax(fit_data), fit_data.shape)
 
-def _center_crop(data: np.ndarray, size: int) -> np.ndarray:
-    size = int(size)
-    size = size if size % 2 == 1 else size + 1
-    size = max(size, 5)
-    half = size // 2
-    cy = data.shape[0] // 2
-    cx = data.shape[1] // 2
-    y1 = max(0, cy - half)
-    y2 = min(data.shape[0], cy + half + 1)
-    x1 = max(0, cx - half)
-    x2 = min(data.shape[1], cx + half + 1)
-    crop = np.asarray(data[y1:y2, x1:x2], dtype=float)
-    if crop.shape != (size, size):
-        pad_y = size - crop.shape[0]
-        pad_x = size - crop.shape[1]
-        crop = np.pad(crop, ((0, pad_y), (0, pad_x)), mode="edge")
-    return crop
+        gauss = models.Gaussian2D(
+            amplitude=float(np.nanmax(fit_data)),
+            x_mean=peak_x,
+            y_mean=peak_y,
+            x_stddev=2.0,
+            y_stddev=2.0,
+        )
 
+        fitter = fitting.LevMarLSQFitter()
+        fitted = fitter(gauss, xx, yy, fit_data)
+
+        # FWHM = 2 * sqrt(2 * ln(2)) * sigma ≈ 2.35482 * sigma
+        fwhm_x = 2.35482 * abs(float(fitted.x_stddev.value))
+        fwhm_y = 2.35482 * abs(float(fitted.y_stddev.value))
+        fwhm = np.mean([fwhm_x, fwhm_y])
+
+        return float(fwhm) if np.isfinite(fwhm) and fwhm > 0 else np.nan
+    except Exception:
+        return np.nan
 
 from astropy.io import fits
 from astropy.wcs import WCS
@@ -362,31 +357,49 @@ def build_triplet(
     sci_path,
     ref_path,
     *,
-    center_x,
-    center_y,
+    ra,
+    dec,
     size=63,
     ref_flip_lr=False,
 ):
-    diff, _ = _load_image_and_wcs(diff_path)
-    sci, _ = _load_image_and_wcs(sci_path)
-    ref, _ = _load_image_and_wcs(ref_path)
+    """Build a triplet by centering each image on the source sky position."""
+    if not np.isfinite(float(ra)) or not np.isfinite(float(dec)):
+        raise ValueError("Finite RA and Dec are required to build a WCS-aligned triplet")
 
-    # If center coordinates are not finite (missing), fall back to image center
-    ny, nx = diff.shape
-    if center_x is None or not np.isfinite(center_x):
-        center_x_use = (nx - 1) / 2.0
-    else:
-        center_x_use = float(center_x)
-    if center_y is None or not np.isfinite(center_y):
-        center_y_use = (ny - 1) / 2.0
-    else:
-        center_y_use = float(center_y)
+    def load_and_crop(path):
+        data, wcs = _load_image_and_wcs(path)
+        # ZTF headers can contain non-celestial axes.  Project through the
+        # celestial WCS so the result is always a 2D pixel position.
+        image_wcs = wcs.celestial if getattr(wcs, "naxis", 2) > 2 else wcs
+        try:
+            x_px, y_px = image_wcs.all_world2pix(float(ra), float(dec), 0)
+        except Exception:
+            try:
+                x_px, y_px = image_wcs.all_world2pix([[float(ra), float(dec)]], 0)[0]
+            except Exception:
+                # Cutouts requested with build_cutout_url are centered on the
+                # requested sky position.  Use that guaranteed cutout center
+                # if an old or incomplete FITS WCS cannot be evaluated.
+                x_px = (data.shape[1] - 1) / 2.0
+                y_px = (data.shape[0] - 1) / 2.0
+        # Astropy may return scalar NumPy arrays even for scalar coordinates.
+        # Convert them before _crop calls round(), which requires real scalars.
+        x_px = float(np.asarray(x_px).reshape(-1)[0])
+        y_px = float(np.asarray(y_px).reshape(-1)[0])
+        if not np.isfinite(x_px) or not np.isfinite(y_px):
+            raise ValueError(f"Could not project source coordinates into {path}")
+        return _crop(data, x_px, y_px, size), (float(x_px), float(y_px))
 
-    diff = _crop(diff, center_x_use, center_y_use, size)
-    sci = _crop(sci, center_x_use, center_y_use, size)
-    ref = _crop(ref, center_x_use, center_y_use, size)
+    diff, diff_position = load_and_crop(diff_path)
+    sci, sci_position = load_and_crop(sci_path)
+    ref, ref_position = load_and_crop(ref_path)
 
-    return np.stack([sci, ref, diff], axis=-1)
+    source_positions = {
+        "sci": sci_position,
+        "ref": ref_position,
+        "diff": diff_position,
+    }
+    return np.stack([sci, ref, diff], axis=-1), source_positions
 
 
 def stage0_diff_index(diff_root: Path, out_root: Path, limit_images: int = 0, object_ids: Iterable[str] | None = None, *, resume: bool = True) -> pd.DataFrame:
@@ -509,12 +522,22 @@ def stage2_triplets(
             complete_rows.extend(cached_complete.to_dict("records"))
 
     completed_ids = set()
-    if cached_complete is not None and not cached_complete.empty and "image_path" in cached_complete.columns:
-        completed_ids = {str(value) for value in cached_complete["image_path"].astype(str).tolist() if str(value)}
+    if cached_complete is not None and not cached_complete.empty and {"image_path", "triplet_path"}.issubset(cached_complete.columns):
+        completed_ids = {
+            str(row["image_path"])
+            for _, row in cached_complete.iterrows()
+            if str(row.get("image_path", ""))
+            and Path(str(row.get("triplet_path", ""))).exists()
+        }
     elif cached_manifest is not None and not cached_manifest.empty and "triplet_ready" in cached_manifest.columns:
         ready_rows = cached_manifest[cached_manifest["triplet_ready"].fillna(False).astype(bool)]
-        if "image_path" in ready_rows.columns:
-            completed_ids = {str(value) for value in ready_rows["image_path"].astype(str).tolist() if str(value)}
+        if {"image_path", "triplet_path"}.issubset(ready_rows.columns):
+            completed_ids = {
+                str(row["image_path"])
+                for _, row in ready_rows.iterrows()
+                if str(row.get("image_path", ""))
+                and Path(str(row.get("triplet_path", ""))).exists()
+            }
 
     if completed_ids:
         snr_images = snr_images[~snr_images["image_path"].astype(str).isin(completed_ids)].copy()
@@ -527,11 +550,14 @@ def stage2_triplets(
 
         object_id = _extract_object_id(row.get("object_id", parsed["object_id"]))
         coords_from_id = coord_index.get(object_id)
-        if coords_from_id is not None:
+        # The SNR/difference-image coordinates identify the detected source.
+        # Use catalog coordinates only when those source coordinates are absent.
+        ra = _safe_float(row.get("ra", parsed["ra"]))
+        dec = _safe_float(row.get("dec", parsed["dec"]))
+        coord_source = "snr_or_diff"
+        if (not np.isfinite(ra) or not np.isfinite(dec)) and coords_from_id is not None:
             ra, dec = coords_from_id
-        else:
-            ra = _safe_float(row.get("ra", parsed["ra"]))
-            dec = _safe_float(row.get("dec", parsed["dec"]))
+            coord_source = "final_class_by_id"
 
         sci_row = {
             "filefracday": parsed["filefracday"],
@@ -601,23 +627,30 @@ def stage2_triplets(
         status = "ok" if sci_status in {"local", "downloaded"} and ref_status in {"local", "downloaded"} else "partial"
 
         triplet = None
-        if status == "ok" and sci_dst.exists() and ref_dst.exists() and diff_dst.exists():
+        source_positions = None
+        if sci_dst.exists() and ref_dst.exists() and diff_dst.exists():
             try:
-                triplet = build_triplet(
+                triplet, source_positions = build_triplet(
                     diff_dst,
                     sci_dst,
                     ref_dst,
-                    center_x=float(row["source_x_px"]),
-                    center_y=float(row["source_y_px"]),
+                    ra=ra,
+                    dec=dec,
                     size=triplet_size,
                     ref_flip_lr=ref_flip_lr,
                 )
-            except Exception:
+                status = "ok"
+            except Exception as exc:
+                logging.warning("Could not build triplet for %s: %s", diff_path.name, exc)
                 triplet = None
+                status = "triplet_error"
 
         manifest = _make_triplet_manifest_row(row, diff_dst, sci_dst, ref_dst, status, ref_sep, triplet)
-        manifest.update({"ra_used": ra, "dec_used": dec, "coord_source": "final_class_by_id" if coords_from_id is not None else "snr_or_diff"})
-        if triplet is not None:
+        manifest.update({"ra_used": ra, "dec_used": dec, "coord_source": coord_source})
+        if triplet is not None and source_positions is not None:
+            for image_key, (source_x, source_y) in source_positions.items():
+                manifest[f"{image_key}_source_x_px"] = source_x
+                manifest[f"{image_key}_source_y_px"] = source_y
             manifest["triplet_ready"] = True
             manifest["triplet_path"] = str(group_dir / "triplet.npy")
             np.save(group_dir / "triplet.npy", triplet)
@@ -848,6 +881,11 @@ def stage3_pretrigger_magnitude(
     coord_lookup = {}
     # also collect source pixel centers from stage2_objects so we can carry them forward
     source_center_lookup = {}
+    # sci_path is produced back in stage2 (per-image) but was previously dropped before
+    # stage4. stage4 needs the diff image (not sci) to measure fwhm_px, since
+    # measure_fwhm_from_image operates on the difference image at the detection position.
+    diff_path_lookup = {}
+    best_braai_seen = {}
     for _, row in stage2_objects.iterrows():
         obj_raw = row.get("object_id")
         if pd.isna(obj_raw):
@@ -856,6 +894,13 @@ def stage3_pretrigger_magnitude(
         if not obj:
             continue
         object_ids.append(obj)
+        row_diff_path = row.get("diff_path")
+        if row_diff_path and isinstance(row_diff_path, str):
+            row_score = _safe_float(row.get("braai_score", np.nan))
+            best_score = best_braai_seen.get(obj, -np.inf)
+            if obj not in diff_path_lookup or (np.isfinite(row_score) and row_score > best_score):
+                diff_path_lookup[obj] = row_diff_path
+                best_braai_seen[obj] = row_score if np.isfinite(row_score) else best_score
         # Use ra_used/dec_used if available, else fallback to ra/dec
         ra = _safe_float(row.get("ra_used", row.get("ra", np.nan)))
         dec = _safe_float(row.get("dec_used", row.get("dec", np.nan)))
@@ -1082,8 +1127,18 @@ def stage3_pretrigger_magnitude(
             pre_records.append(record_dict)
 
         pre_mags = [float(item["mag"]) for item in pre_records if np.isfinite(item.get("mag", np.nan))]
+        pre_mag_errs = [float(item["mag_err"]) for item in pre_records if np.isfinite(item.get("mag_err", np.nan))]
         pre_upper_limits = [float(item["upper_limit"]) for item in pre_records if np.isfinite(item.get("upper_limit", np.nan))]
         pre_ref = float(np.nanmedian(pre_mags)) if pre_mags else np.nan
+        pre_ref_err = float(np.nanmedian(pre_mag_errs)) if pre_mag_errs else np.nan
+        # residual field name varies by photometry-record version; check the common aliases
+        pre_residuals = [
+            float(item[key])
+            for item in pre_records
+            for key in ("residual", "max_residual", "fit_residual")
+            if key in item and np.isfinite(_safe_float(item.get(key)))
+        ]
+        pre_max_residual = float(np.nanmax(pre_residuals)) if pre_residuals else np.nan
 
         post_ref_mag = float(np.nanmedian(post_mags)) if post_mags else np.nan
         post_ref_err = float(np.nanmedian(post_mag_errs)) if post_mag_errs else np.nan
@@ -1123,8 +1178,8 @@ def stage3_pretrigger_magnitude(
             "object_id": object_id,
             "n_pretrigger_images": n_pre,
             "pretrigger_mag_ref": pre_ref if pre_mags else np.nan,
-            "pretrigger_mag_ref_err": np.nan,
-            "pretrigger_mag_max_residual": np.nan,
+            "pretrigger_mag_ref_err": pre_ref_err,
+            "pretrigger_mag_max_residual": pre_max_residual,
             "pretrigger_mag_upper_limit": float(np.nanmax(pre_upper_limits)) if pre_upper_limits else np.nan,
             "pretrigger_mag_consistent": consistent,
             "pretrigger_mag_pass": pass_flag,
@@ -1137,6 +1192,7 @@ def stage3_pretrigger_magnitude(
             "source_y_px": sy,
             "detection_ra": dra,
             "detection_dec": ddec,
+            "diff_path": diff_path_lookup.get(object_id, ""),
         })
 
     mag_df = pd.DataFrame(image_rows)
@@ -1159,10 +1215,14 @@ def stage4_host_mag(stage3_objects: pd.DataFrame, final_class_df: pd.DataFrame, 
         if resume:
             cached_ids = cached_host["object_id"].astype(str).map(normalize_object_id).tolist()
             current_ids = stage3_objects["object_id"].astype(str).map(normalize_object_id).tolist()
-            if cached_ids == current_ids:
+            cached_diff_fwhm = pd.to_numeric(cached_host.get("diff_fwhm"), errors="coerce")
+            diff_fwhm_cache_valid = "diff_fwhm" in cached_host.columns and cached_diff_fwhm.notna().all()
+            cached_fwhm = pd.to_numeric(cached_host.get("fwhm_px"), errors="coerce")
+            fwhm_cache_valid = "fwhm_px" in cached_host.columns and cached_fwhm.notna().all()
+            if cached_ids == current_ids and fwhm_cache_valid and diff_fwhm_cache_valid:
                 return cached_host, cached_final
             logging.info(
-                "Recomputing stage4 outputs because stage3 object IDs changed: %s -> %s",
+                "Recomputing stage4 outputs because cached IDs or diff_fwhm values are stale: %s -> %s",
                 len(cached_ids),
                 len(current_ids),
             )
@@ -1181,6 +1241,8 @@ def stage4_host_mag(stage3_objects: pd.DataFrame, final_class_df: pd.DataFrame, 
         final["detection_y_px"] = np.nan
 
     if final.empty:
+        final["fwhm_px"] = np.nan
+        final["diff_fwhm"] = np.nan
         write_csv(final, host_objects_path)
         write_csv(final, final_candidates_path)
         return final, final
@@ -1250,8 +1312,8 @@ def stage4_host_mag(stage3_objects: pd.DataFrame, final_class_df: pd.DataFrame, 
 
     detection_ra_candidates = ["detection_ra_deg", "detection_ra", "catalog_ra_deg", "ra_used", "ra"]
     detection_dec_candidates = ["detection_dec_deg", "detection_dec", "catalog_dec_deg", "dec_used", "dec"]
-    host_ra_candidates = ["host_ra", "catalog_ra_deg"]
-    host_dec_candidates = ["host_dec", "catalog_dec_deg"]
+    host_ra_candidates = ["RA_fin", "ra_fin", "host_ra", "catalog_ra_deg", "ra", "RA"]
+    host_dec_candidates = ["DEC_fin", "dec_fin", "host_dec", "catalog_dec_deg", "dec", "DEC"]
 
     detection_ra = None
     detection_dec = None
@@ -1265,14 +1327,21 @@ def stage4_host_mag(stage3_objects: pd.DataFrame, final_class_df: pd.DataFrame, 
         if candidate in final.columns:
             detection_dec = pd.to_numeric(final[candidate], errors="coerce")
             break
-    for candidate in host_ra_candidates:
-        if candidate in final.columns:
-            host_ra = pd.to_numeric(final[candidate], errors="coerce")
-            break
-    for candidate in host_dec_candidates:
-        if candidate in final.columns:
-            host_dec = pd.to_numeric(final[candidate], errors="coerce")
-            break
+
+    host_ra_col = next((c for c in host_ra_candidates if c in final_class_df.columns), None)
+    host_dec_col = next((c for c in host_dec_candidates if c in final_class_df.columns), None)
+    if host_ra_col is not None:
+        ra_index = final_class_df.copy()
+        ra_index["object_id"] = ra_index["object_id"].astype(str).map(normalize_object_id)
+        ra_index[host_ra_col] = pd.to_numeric(ra_index[host_ra_col], errors="coerce")
+        ra_lookup = ra_index[["object_id", host_ra_col]].drop_duplicates(subset=["object_id"]).set_index("object_id")[host_ra_col]
+        host_ra = final_id_norm.map(ra_lookup)
+    if host_dec_col is not None:
+        dec_index = final_class_df.copy()
+        dec_index["object_id"] = dec_index["object_id"].astype(str).map(normalize_object_id)
+        dec_index[host_dec_col] = pd.to_numeric(dec_index[host_dec_col], errors="coerce")
+        dec_lookup = dec_index[["object_id", host_dec_col]].drop_duplicates(subset=["object_id"]).set_index("object_id")[host_dec_col]
+        host_dec = final_id_norm.map(dec_lookup)
 
     host_offsets = []
     for idx in final.index:
@@ -1283,9 +1352,42 @@ def stage4_host_mag(stage3_objects: pd.DataFrame, final_class_df: pd.DataFrame, 
         host_offsets.append(compute_host_offset(dra, ddec, hra, hdec))
     final["host_offset_arcsec"] = host_offsets
 
+    # Measure the source width directly from the selected difference image.
+    fwhm_values = []
+    for _, row in final.iterrows():
+        diff_path = row.get("diff_path")
+        x_px = _safe_float(row.get("detection_x_px", row.get("source_x_px", np.nan)))
+        y_px = _safe_float(row.get("detection_y_px", row.get("source_y_px", np.nan)))
+        if not diff_path or not Path(str(diff_path)).exists() or not np.isfinite(x_px) or not np.isfinite(y_px):
+            fwhm_values.append(np.nan)
+            continue
+        fwhm_values.append(measure_fwhm_from_image(Path(str(diff_path)), x_px, y_px, box_size=21))
+    final["fwhm_px"] = fwhm_values
+
+    # Copy the stage-1 SEEING/FWHM for the selected difference image.  Stage 2
+    # may relocate the file, so match by basename rather than full path.
+    stage1_images_path = out_root / "stage1" / "april_stage1_quadratic_snr_images.csv"
+    diff_fwhm_lookup = {}
+    if stage1_images_path.exists():
+        stage1_images = pd.read_csv(stage1_images_path, low_memory=False)
+        if "image_path" in stage1_images.columns and "fwhm_px" in stage1_images.columns:
+            for _, stage1_row in stage1_images.iterrows():
+                image_name = Path(str(stage1_row.get("image_path", ""))).name
+                if image_name:
+                    diff_fwhm_lookup[image_name] = _safe_float(stage1_row.get("fwhm_px"))
+
+    final["diff_fwhm"] = final["diff_path"].map(
+        lambda value: diff_fwhm_lookup.get(Path(str(value)).name, np.nan)
+    )
+
     passed = final[final["host_rmag_pass"]].copy()
     write_csv(final, host_objects_path)
     write_csv(passed, final_candidates_path)
+
+    print("detection_ra:", detection_ra.head() if detection_ra is not None else None)
+    print("detection_dec:", detection_dec.head() if detection_dec is not None else None)
+    print("host_ra:", host_ra.head() if host_ra is not None else None)
+    print("host_dec:", host_dec.head() if host_dec is not None else None)   
     return final, passed
 
 
@@ -1364,7 +1466,7 @@ def save_stage4_results(
                 s = _np.nanstd(p)
                 if not _np.isfinite(s) or s == 0:
                     s = 1.0
-                planes.append((p - m) / s)
+                planes.append((p-m)/s)
 
             # 3-panel normalized image with flipped ref and smoothed row below
             try:
@@ -1393,19 +1495,45 @@ def save_stage4_results(
 
                 fig, axes = plt.subplots(2, 3, figsize=(10, 8))
                 im = None
-                vmax = 5
+
+                from astropy.visualization import ZScaleInterval
+
+                zscale = ZScaleInterval(contrast=0.2)
+                limits = []
+                for plane in display_planes:
+                    finite_plane = plane[_np.isfinite(plane)]
+                    try:
+                        vmin, vmax = zscale.get_limits(finite_plane)
+                    except Exception:
+                        vmin, vmax = -3.0, 3.0
+                    if not _np.isfinite(vmin) or not _np.isfinite(vmax) or vmin >= vmax:
+                        vmin, vmax = -3.0, 3.0
+                    limits.append((float(vmin), float(vmax)))
+
                 titles = ("sci", "ref", "diff")
                 for col in range(3):
                     ax = axes[0, col]
-                    im = ax.imshow(display_planes[col], origin="lower", cmap="RdBu", vmin=-vmax, vmax=vmax)
+                    vmin, vmax = limits[col]
+                    im = ax.imshow(display_planes[col], origin="lower", cmap="gray", vmin=vmin, vmax=vmax)
                     ax.set_title(titles[col])
                     ax.axis("off")
                     ax2 = axes[1, col]
-                    ax2.imshow(smoothed[col], origin="lower", cmap="RdBu", vmin=-vmax, vmax=vmax)
+                    ax2.imshow(smoothed[col], origin="lower", cmap="gray", vmin=vmin, vmax=vmax)
                     ax2.set_title(f"{titles[col]} (smoothed)")
                     ax2.axis("off")
 
-                fig.colorbar(im, ax=axes.ravel().tolist(), orientation="horizontal", fraction=0.05)
+                    # WCS-based cropping centers the SNR source in the diff panels.
+                    if col == 2:
+                        center = display_planes[col].shape[0] // 2
+                        gap = 5
+                        arm_len = 12
+                        for crosshair_ax in (ax, ax2):
+                            crosshair_ax.plot([center, center], [center - arm_len, center - gap], color="red", linewidth=1.8, solid_capstyle="butt")
+                            crosshair_ax.plot([center, center], [center + gap, center + arm_len], color="red", linewidth=1.8, solid_capstyle="butt")
+                            crosshair_ax.plot([center - arm_len, center - gap], [center, center], color="red", linewidth=1.8, solid_capstyle="butt")
+                            crosshair_ax.plot([center + gap, center + arm_len], [center, center], color="red", linewidth=1.8, solid_capstyle="butt")
+
+                fig.colorbar(im, ax=axes.ravel().tolist(), orientation="vertical", location="right", fraction=0.05)
                 fig.savefig(obj_dir / f"triplet_norm_{i}.png", dpi=400, bbox_inches="tight")
                 plt.close(fig)
             except Exception:
