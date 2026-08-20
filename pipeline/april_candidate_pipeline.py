@@ -852,15 +852,40 @@ def stage3_pretrigger_magnitude(
         cached_images = load_csv_if_exists(images_path)
         cached_objects = load_csv_if_exists(objects_path)
         if cached_images is not None and cached_objects is not None and not cached_objects.empty:
-            if "pretrigger_mag_pass" in cached_objects.columns and cached_objects["pretrigger_mag_pass"].any():
+            cached_ids = set(cached_objects["object_id"].astype(str).map(normalize_object_id)) if "object_id" in cached_objects.columns else set()
+            cached_post_filters = {}
+            if {"object_id", "phase", "filter"}.issubset(cached_images.columns):
+                cached_post = cached_images[cached_images["phase"].astype(str) == "posttrigger"]
+                cached_post = cached_post.copy()
+                cached_post["obs_date"] = cached_post["image_path"].map(
+                    lambda value: _parse_filefracday_datetime(
+                        (parse_diff_name(Path(str(value)).name) or {}).get("filefracday")
+                    )
+                    if "image_path" in cached_post.columns
+                    else pd.NaT
+                )
+                cached_post = cached_post[
+                    (cached_post["obs_date"] >= pd.to_datetime(trigger_date))
+                    & (cached_post["obs_date"] < pd.to_datetime(trigger_date) + pd.Timedelta(days=2))
+                ]
+                for cached_id, group in cached_post.groupby(cached_post["object_id"].astype(str).map(normalize_object_id)):
+                    cached_post_filters[cached_id] = set(group["filter"].dropna().astype(str))
+            cache_has_all_filters = bool(cached_ids) and all(
+                {"zg", "zr", "zi"}.issubset(cached_post_filters.get(cached_id, set()))
+                for cached_id in cached_ids
+            )
+            if "pretrigger_mag_pass" in cached_objects.columns and cached_objects["pretrigger_mag_pass"].any() and cache_has_all_filters:
                 passed = cached_objects[cached_objects["pretrigger_mag_pass"]].copy()
                 return cached_images, cached_objects, passed
             logging.info("Recomputing stage3 pre-trigger analysis because cached outputs contain no passing candidates")
 
     trigger = pd.to_datetime(trigger_date)
     window_start = trigger - pd.Timedelta(days=int(lookback_days))
-    posttrigger_window_start = trigger + pd.Timedelta(days=2)
+    # Include the trigger day and the following days in every filter.
+    # This covers 25-26 April as well as the remainder of the post-trigger window.
+    posttrigger_window_start = trigger
     posttrigger_window_end = trigger + pd.Timedelta(days=int(posttrigger_days))
+    first_two_days_end = trigger + pd.Timedelta(days=2)
 
     # Prepare diff_index with object_id and obs_date
     work = diff_index.copy()
@@ -936,8 +961,8 @@ def stage3_pretrigger_magnitude(
     final_rownum_map = _build_final_rownum_map(final_class_df)
 
     # Identify objects that need pre-trigger downloads and post-trigger downloads.
-    # The first two days after trigger are assumed to already be available; the next
-    # `posttrigger_days` days are downloaded here before the light-curve analysis.
+    # Post-trigger coverage is checked independently for each g/r/i filter,
+    # including the trigger day and the following two days.
     download_needed = {}
     download_post_needed = {}
     if download_missing:
@@ -947,8 +972,12 @@ def stage3_pretrigger_magnitude(
             if len(pre) == 0:
                 download_needed[obj] = True
 
-            post = obj_work[(obj_work["obs_date"] >= posttrigger_window_start) & (obj_work["obs_date"] <= posttrigger_window_end)]
-            if len(post) == 0:
+            post = obj_work[
+                (obj_work["obs_date"] >= posttrigger_window_start)
+                & (obj_work["obs_date"] < first_two_days_end)
+            ]
+            post_filters = set(post["filter"].dropna().astype(str)) if "filter" in post.columns else set()
+            if not {"zg", "zr", "zi"}.issubset(post_filters):
                 download_post_needed[obj] = True
 
     if download_needed or download_post_needed:
@@ -974,10 +1003,15 @@ def stage3_pretrigger_magnitude(
             date_start = window_start.strftime("%Y-%m-%d")
             date_end = trigger.strftime("%Y-%m-%d")
             if obj in download_post_needed:
-                date_start = posttrigger_window_start.strftime("%Y-%m-%d")
+                # The archive query uses an exclusive lower date bound. Search
+                # one day earlier so observations on the trigger date are not
+                # discarded before the exact Python-side window check below.
+                date_start = (posttrigger_window_start - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
                 date_end = posttrigger_window_end.strftime("%Y-%m-%d")
-                search_csv = out_dir / f"posttrigger_search_{rownum}.csv"
-                search_progress = out_dir / f"posttrigger_search_{rownum}.progress.json"
+                # Use a new cache namespace because older post-trigger search
+                # files were created during the r/i-only download workflow.
+                search_csv = out_dir / f"posttrigger_search_all_filters_v2_{rownum}.csv"
+                search_progress = out_dir / f"posttrigger_search_all_filters_v2_{rownum}.progress.json"
 
             def _fetch_meta():
                 try:
@@ -988,7 +1022,7 @@ def stage3_pretrigger_magnitude(
                         batch_size=50,
                         size_deg=0.01,
                         product_type="sci",
-                        filtercodes=["zr"],
+                        filtercodes=["zg", "zr", "zi"],
                         date_start=date_start,
                         date_end=date_end,
                         timeout=120,
@@ -1003,7 +1037,7 @@ def stage3_pretrigger_magnitude(
                         batch_size=50,
                         size_deg=0.01,
                         product_type="sci",
-                        filtercodes=["zr"],
+                        filtercodes=["zg", "zr", "zi"],
                         date_start=date_start,
                         date_end=date_end,
                         timeout=300,
@@ -1021,7 +1055,7 @@ def stage3_pretrigger_magnitude(
                         ds = cur.strftime("%Y-%m-%d")
                         de = (cur + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
                         try:
-                            part = metadata_search_batch(positions=[(ra, dec)], size_deg=0.01, product_type="sci", ct="csv", date_start=ds, date_end=de, filtercodes=["zr"], timeout=180)
+                            part = metadata_search_batch(positions=[(ra, dec)], size_deg=0.01, product_type="sci", ct="csv", date_start=ds, date_end=de, filtercodes=["zg", "zr", "zi"], timeout=180)
                             if part is None:
                                 part = pd.DataFrame()
                             parts.append(part)
@@ -1039,6 +1073,11 @@ def stage3_pretrigger_magnitude(
             if df_meta is None or df_meta.empty:
                 logging.warning(f"Metadata search yielded no results for {obj}")
                 continue
+
+            # ztf_search currently does not apply filtercodes server-side.
+            # Keep all returned g/r/i rows explicitly for the post-trigger set.
+            if obj in download_post_needed and "filtercode" in df_meta.columns:
+                df_meta = df_meta[df_meta["filtercode"].astype(str).str.lower().isin({"g", "r", "i", "zg", "zr", "zi"})].copy()
 
             for _, mrow in df_meta.iterrows():
                 filefracday = mrow.get("filefracday", "")
@@ -1219,7 +1258,8 @@ def stage4_host_mag(stage3_objects: pd.DataFrame, final_class_df: pd.DataFrame, 
             diff_fwhm_cache_valid = "diff_fwhm" in cached_host.columns and cached_diff_fwhm.notna().all()
             cached_fwhm = pd.to_numeric(cached_host.get("fwhm_px"), errors="coerce")
             fwhm_cache_valid = "fwhm_px" in cached_host.columns and cached_fwhm.notna().all()
-            if cached_ids == current_ids and fwhm_cache_valid and diff_fwhm_cache_valid:
+            magnitude_cache_valid = {"best_snr_mag", "best_snr_mag_err"}.issubset(cached_host.columns)
+            if cached_ids == current_ids and fwhm_cache_valid and diff_fwhm_cache_valid and magnitude_cache_valid:
                 return cached_host, cached_final
             logging.info(
                 "Recomputing stage4 outputs because cached IDs or diff_fwhm values are stale: %s -> %s",
@@ -1309,6 +1349,25 @@ def stage4_host_mag(stage3_objects: pd.DataFrame, final_class_df: pd.DataFrame, 
     # 3. Map the per-object maximum SNR into the final DataFrame
     final["best_snr"] = pd.to_numeric(final_id_norm.map(snr_lookup), errors="coerce")
 
+    # Select the stage-3 measurement from the image with the highest SNR for
+    # each object, and carry its magnitude and uncertainty into stage 4.
+    stage3_images_path = out_root / "stage3" / "april_stage3_pretrigger_mag_images.csv"
+    best_snr_mag_lookup = {}
+    if stage3_images_path.exists():
+        stage3_images = pd.read_csv(stage3_images_path, low_memory=False)
+        required_columns = {"object_id", "snr", "mag", "mag_err"}
+        if required_columns.issubset(stage3_images.columns):
+            stage3_images = stage3_images.copy()
+            stage3_images["object_id"] = stage3_images["object_id"].astype(str).map(normalize_object_id)
+            stage3_images["snr"] = pd.to_numeric(stage3_images["snr"], errors="coerce")
+            stage3_images["mag"] = pd.to_numeric(stage3_images["mag"], errors="coerce")
+            stage3_images["mag_err"] = pd.to_numeric(stage3_images["mag_err"], errors="coerce")
+            best_stage3_rows = stage3_images.sort_values("snr", ascending=False).drop_duplicates("object_id")
+            best_snr_mag_lookup = best_stage3_rows.set_index("object_id")[["mag", "mag_err"]].to_dict("index")
+
+    final["best_snr_mag"] = final_id_norm.map(lambda value: best_snr_mag_lookup.get(value, {}).get("mag", np.nan))
+    final["best_snr_mag_err"] = final_id_norm.map(lambda value: best_snr_mag_lookup.get(value, {}).get("mag_err", np.nan))
+
 
     detection_ra_candidates = ["detection_ra_deg", "detection_ra", "catalog_ra_deg", "ra_used", "ra"]
     detection_dec_candidates = ["detection_dec_deg", "detection_dec", "catalog_dec_deg", "dec_used", "dec"]
@@ -1383,11 +1442,6 @@ def stage4_host_mag(stage3_objects: pd.DataFrame, final_class_df: pd.DataFrame, 
     passed = final[final["host_rmag_pass"]].copy()
     write_csv(final, host_objects_path)
     write_csv(passed, final_candidates_path)
-
-    print("detection_ra:", detection_ra.head() if detection_ra is not None else None)
-    print("detection_dec:", detection_dec.head() if detection_dec is not None else None)
-    print("host_ra:", host_ra.head() if host_ra is not None else None)
-    print("host_dec:", host_dec.head() if host_dec is not None else None)   
     return final, passed
 
 
@@ -1670,12 +1724,13 @@ def save_stage4_results(
                         fig, ax = plt.subplots(figsize=(9, 4))
                         for filt, color in filter_colors.items():
                             mask_f = ssel_plot["filt"] == filt
-                            if mask_f.any() and ssel_plot.loc[mask_f, "mag"].notna().any():
+                            if mask_f.any():
                                 det = ssel_plot[mask_f & ssel_plot["mag"].notna() & (ssel_plot["snr"] >= 3)]
-                                ax.errorbar(det["obs_datetime"].values, det["mag"].values, yerr=det.get("mag_err"), fmt="o", color=color, label=f"Обнаружение ({filt})")
-                            if mask_f.any() and ssel_plot.loc[mask_f, "upper_limit"].notna().any():
+                                if not det.empty:
+                                    ax.errorbar(det["obs_datetime"].values, det["mag"].values, yerr=det.get("mag_err"), fmt="o", color=color, label=f"Обнаружение ({filt})")
                                 ul = ssel_plot[mask_f & ssel_plot["upper_limit"].notna()]
-                                ax.scatter(ul["obs_datetime"].values, ul["upper_limit"].values, marker="v", color=color, s=60, alpha=0.6, label=f"Верхний предел ({filt})")
+                                if not ul.empty:
+                                    ax.scatter(ul["obs_datetime"].values, ul["upper_limit"].values, marker="v", color=color, s=60, alpha=0.6, label=f"Верхний предел ({filt})")
 
                         # xticks: use a date locator/formatter so labels do not overlap
                         import matplotlib.dates as mdates
