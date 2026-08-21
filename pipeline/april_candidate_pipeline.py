@@ -24,7 +24,7 @@ except Exception as exc:  # pragma: no cover - dependency guard
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from braai_batch import build_triplet_batch, load_braai_model, predict_braai_batch
-from ztf_downloads.fetch_sci_ref_for_snr import _build_exact_coord_index, choose_ref_row, compute_host_offset
+from ztf_downloads.fetch_sci_ref_for_snr import _build_exact_coord_index, compute_host_offset
 from ztf_downloads.snr_photometry_quadratic import process_difference_image, process_difference_images
 from ztf_downloads.ztf_download import build_cutout_url, build_sci_url, build_ref_url, download_file
 
@@ -248,7 +248,21 @@ def collect_diff_index(diff_root: Path) -> pd.DataFrame:
                 "dec": parsed["dec"],
             }
         )
-    return pd.DataFrame(rows)
+    index_df = pd.DataFrame(rows)
+    if index_df.empty or "parse_status" not in index_df.columns:
+        return index_df
+
+    # The same physical exposure (object/field/ccd/quadrant/filter/filefracday)
+    # can end up saved under multiple filenames if it was downloaded more than
+    # once with a slightly different cutout center (e.g. before download centers
+    # were pinned to the fixed galaxy catalog position). Keep exactly one file
+    # per exposure so it isn't measured/counted more than once downstream.
+    # Sorting by image_path first makes the kept survivor deterministic.
+    ok_rows = index_df[index_df["parse_status"] == "ok"].sort_values("image_path")
+    dedup_keys = ["object_id", "field", "ccdid", "qid", "filefracday", "filter"]
+    ok_rows = ok_rows.drop_duplicates(subset=dedup_keys, keep="first")
+    other_rows = index_df[index_df["parse_status"] != "ok"]
+    return pd.concat([ok_rows, other_rows], ignore_index=True)
 
 
 def measure_fwhm_from_image(diff_path: Path, center_x: float, center_y: float, box_size: int = 21) -> float:
@@ -324,6 +338,40 @@ def _load_image_and_wcs(path):
             if getattr(hdu, "data", None) is not None and hdu.data.ndim == 2:
                 return np.asarray(hdu.data, dtype=np.float32), WCS(hdu.header)
     raise ValueError(f"No 2D image found in {path}")
+
+
+def _sky_coordinates_from_pixel(path: Path, x_px: float, y_px: float) -> tuple[float, float] | None:
+    """Convert a 2D image pixel position to sky coordinates using its WCS."""
+    if not np.isfinite(x_px) or not np.isfinite(y_px):
+        return None
+    try:
+        _, wcs = _load_image_and_wcs(path)
+        image_wcs = wcs.celestial if getattr(wcs, "naxis", 2) > 2 else wcs
+        ra, dec = image_wcs.all_pix2world(float(x_px), float(y_px), 0)
+        ra = float(np.asarray(ra).reshape(-1)[0])
+        dec = float(np.asarray(dec).reshape(-1)[0])
+        if np.isfinite(ra) and np.isfinite(dec):
+            return ra, dec
+    except Exception:
+        pass
+    return None
+
+
+def _pixel_coordinates_from_sky(path: Path, ra: float, dec: float) -> tuple[float, float] | None:
+    """Convert a sky position to pixels in a specific 2D FITS image."""
+    if not np.isfinite(ra) or not np.isfinite(dec):
+        return None
+    try:
+        _, wcs = _load_image_and_wcs(path)
+        image_wcs = wcs.celestial if getattr(wcs, "naxis", 2) > 2 else wcs
+        x_px, y_px = image_wcs.all_world2pix(float(ra), float(dec), 0)
+        x_px = float(np.asarray(x_px).reshape(-1)[0])
+        y_px = float(np.asarray(y_px).reshape(-1)[0])
+        if np.isfinite(x_px) and np.isfinite(y_px):
+            return x_px, y_px
+    except Exception:
+        pass
+    return None
 
 
 def _crop(data, cx, cy, size):
@@ -486,9 +534,7 @@ def stage2_triplets(
     *,
     sci_root: Path,
     ref_root: Path,
-    ref_meta: pd.DataFrame,
     final_class_df: pd.DataFrame,
-    max_ref_sep_arcsec: float,
     download_missing: bool,
     triplet_size: int,
     ref_flip_lr: bool,
@@ -511,6 +557,49 @@ def stage2_triplets(
     manifest_rows: list[dict] = []
     complete_rows: list[dict] = []
 
+    # A candidate can have several detections (one diff image per epoch). Each
+    # image's own SNR centroid wobbles by a fraction of a pixel from noise, so
+    # measuring it independently per image made every triplet for the same
+    # candidate crop around a slightly different sky position -- the first
+    # triplet built would land at a different center than the rest. Instead,
+    # anchor every triplet for a candidate on ONE fixed sky position: the
+    # measured centroid of its best (highest-SNR) detection, falling back to
+    # the catalog position. All sci/ref/diff cutouts for that candidate are
+    # then built (and downloaded) around that same anchor.
+    candidate_center_lookup: dict[str, tuple[float, float]] = {}
+    candidate_center_source: dict[str, str] = {}
+    if not snr_images.empty:
+        ranked = snr_images.copy()
+        ranked["_snr_rank"] = pd.to_numeric(ranked.get("snr"), errors="coerce").fillna(-np.inf)
+        ranked["_object_id"] = ranked.apply(
+            lambda r: _extract_object_id(r.get("object_id", (parse_diff_name(Path(str(r["image_path"])).name) or {}).get("object_id"))),
+            axis=1,
+        )
+        ranked = ranked[ranked["_object_id"].astype(bool)]
+        ranked = ranked.sort_values("_snr_rank", ascending=False)
+        best_per_object = ranked.drop_duplicates(subset=["_object_id"], keep="first")
+        for _, best_row in best_per_object.iterrows():
+            obj = best_row["_object_id"]
+            best_diff_path = Path(str(best_row["image_path"]))
+            best_parsed = parse_diff_name(best_diff_path.name) or {}
+            sx = _safe_float(best_row.get("source_x_px", np.nan))
+            sy = _safe_float(best_row.get("source_y_px", np.nan))
+            centroid_sky = _sky_coordinates_from_pixel(best_diff_path, sx, sy)
+            if centroid_sky is not None:
+                candidate_center_lookup[obj] = centroid_sky
+                candidate_center_source[obj] = "best_detection_centroid_wcs"
+                continue
+            coords_from_id = coord_index.get(obj)
+            if coords_from_id is not None:
+                candidate_center_lookup[obj] = coords_from_id
+                candidate_center_source[obj] = "final_class_by_id"
+                continue
+            fallback_ra = _safe_float(best_row.get("ra", best_parsed.get("ra")))
+            fallback_dec = _safe_float(best_row.get("dec", best_parsed.get("dec")))
+            if np.isfinite(fallback_ra) and np.isfinite(fallback_dec):
+                candidate_center_lookup[obj] = (fallback_ra, fallback_dec)
+                candidate_center_source[obj] = "snr_or_diff"
+
     cached_manifest = None
     cached_complete = None
     if resume:
@@ -532,12 +621,16 @@ def stage2_triplets(
     elif cached_manifest is not None and not cached_manifest.empty and "triplet_ready" in cached_manifest.columns:
         ready_rows = cached_manifest[cached_manifest["triplet_ready"].fillna(False).astype(bool)]
         if {"image_path", "triplet_path"}.issubset(ready_rows.columns):
-            completed_ids = {
-                str(row["image_path"])
-                for _, row in ready_rows.iterrows()
-                if str(row.get("image_path", ""))
-                and Path(str(row.get("triplet_path", ""))).exists()
-            }
+            still_valid = ready_rows[
+                ready_rows["image_path"].astype(str).astype(bool)
+                & ready_rows["triplet_path"].apply(lambda p: Path(str(p)).exists())
+            ]
+            completed_ids = set(still_valid["image_path"].astype(str))
+            # objects.csv was missing/empty even though these triplets already
+            # exist on disk (per the manifest). Restore them into complete_rows
+            # so they still reach stage2_braai for scoring, instead of being
+            # marked "already done" and silently dropped from the pipeline.
+            complete_rows.extend(still_valid.to_dict("records"))
 
     if completed_ids:
         snr_images = snr_images[~snr_images["image_path"].astype(str).isin(completed_ids)].copy()
@@ -550,12 +643,18 @@ def stage2_triplets(
 
         object_id = _extract_object_id(row.get("object_id", parsed["object_id"]))
         coords_from_id = coord_index.get(object_id)
-        # The SNR/difference-image coordinates identify the detected source.
-        # Use catalog coordinates only when those source coordinates are absent.
+        # Every triplet for this candidate is centered on the SAME fixed sky
+        # position (see candidate_center_lookup above), not on a centroid
+        # re-measured from this particular image -- otherwise triplets from
+        # different detections of the same candidate drift apart by the
+        # per-image centroiding noise.
         ra = _safe_float(row.get("ra", parsed["ra"]))
         dec = _safe_float(row.get("dec", parsed["dec"]))
         coord_source = "snr_or_diff"
-        if (not np.isfinite(ra) or not np.isfinite(dec)) and coords_from_id is not None:
+        if object_id in candidate_center_lookup:
+            ra, dec = candidate_center_lookup[object_id]
+            coord_source = candidate_center_source[object_id]
+        elif coords_from_id is not None and (not np.isfinite(ra) or not np.isfinite(dec)):
             ra, dec = coords_from_id
             coord_source = "final_class_by_id"
 
@@ -592,37 +691,35 @@ def stage2_triplets(
             except Exception:
                 sci_status = "missing"
 
-        row_for_ref = {"filter": parsed["filter"], "field": parsed["field"], "ccdid": parsed["ccdid"], "qid": parsed["qid"], "ra": ra, "dec": dec}
-        ref_choice = choose_ref_row(ref_meta, row_for_ref, max_ref_sep_arcsec)
-        ref_dst = group_dir / "ref" / ""
-        ref_status = "no_ref_match"
-        ref_sep = np.nan
-        if ref_choice is not None:
-            ref_sep = float(ref_choice["match_sep_arcsec"])
-            ref_row = {
-                "filefracday": str(ref_choice["filefracday"]),
-                "field": _safe_int(ref_choice["field"]),
-                "filtercode": str(ref_choice["filtercode"]),
-                "ccdid": _safe_int(ref_choice["ccdid"]),
-                "qid": _safe_int(ref_choice["qid"]),
-                "imgtypecode": str(ref_choice.get("imgtypecode", "o")),
-            }
-            ref_url = build_ref_url(ref_row)
-            ref_name = Path(ref_url).name
-            ref_src = ref_index.get(ref_name)
-            ref_dst = group_dir / "ref" / ref_name
-            ref_dst.parent.mkdir(parents=True, exist_ok=True)
-            if ref_src is not None and ref_src.exists():
-                if not ref_dst.exists():
-                    ref_dst.write_bytes(ref_src.read_bytes())
-                ref_status = "local"
-            elif download_missing:
-                try:
-                    downloaded = download_file(build_cutout_url(ref_url, ra, dec, size_arcsec=240), out_dir=ref_dst.parent)
-                    ref_dst = Path(downloaded)
-                    ref_status = "downloaded"
-                except Exception:
-                    ref_status = "missing"
+        # Reference frames are static per field/ccd/quadrant/filter -- no need to
+        # search a pre-fetched reference-metadata table for a "best match". Build
+        # the URL directly from the diff image's own field/ccd/qid/filter, same
+        # as the science image above, and fetch it on demand if not already local.
+        ref_row = {
+            "filefracday": parsed["filefracday"],
+            "field": parsed["field"],
+            "filtercode": parsed["filter"],
+            "ccdid": parsed["ccdid"],
+            "qid": parsed["qid"],
+            "imgtypecode": "o",
+        }
+        ref_url = build_ref_url(ref_row)
+        ref_name = Path(ref_url).name
+        ref_src = ref_index.get(ref_name)
+        ref_dst = group_dir / "ref" / ref_name
+        ref_dst.parent.mkdir(parents=True, exist_ok=True)
+        ref_status = "missing"
+        if ref_src is not None and ref_src.exists():
+            if not ref_dst.exists():
+                ref_dst.write_bytes(ref_src.read_bytes())
+            ref_status = "local"
+        elif download_missing:
+            try:
+                downloaded = download_file(build_cutout_url(ref_url, ra, dec, size_arcsec=240), out_dir=ref_dst.parent)
+                ref_dst = Path(downloaded)
+                ref_status = "downloaded"
+            except Exception:
+                ref_status = "missing"
 
         status = "ok" if sci_status in {"local", "downloaded"} and ref_status in {"local", "downloaded"} else "partial"
 
@@ -645,7 +742,7 @@ def stage2_triplets(
                 triplet = None
                 status = "triplet_error"
 
-        manifest = _make_triplet_manifest_row(row, diff_dst, sci_dst, ref_dst, status, ref_sep, triplet)
+        manifest = _make_triplet_manifest_row(row, diff_dst, sci_dst, ref_dst, status, np.nan, triplet)
         manifest.update({"ra_used": ra, "dec_used": dec, "coord_source": coord_source})
         if triplet is not None and source_positions is not None:
             for image_key, (source_x, source_y) in source_positions.items():
@@ -959,6 +1056,12 @@ def stage3_pretrigger_magnitude(
     except Exception:
         final_class_df = None
     final_rownum_map = _build_final_rownum_map(final_class_df)
+    # Fixed catalog position per object -- used to CENTER time-window downloads,
+    # so the same physical exposure always gets the same filename/crop no matter
+    # which detection happens to be "best" in a given run. coord_lookup (built
+    # above from ra_used/dec_used) is still used later for reporting the actual
+    # measured detection position; it must not be used to choose download centers.
+    galaxy_coord_lookup = _build_exact_coord_index(final_class_df)
 
     # Identify objects that need pre-trigger downloads and post-trigger downloads.
     # Post-trigger coverage is checked independently for each g/r/i filter,
@@ -989,10 +1092,10 @@ def stage3_pretrigger_magnitude(
         )
         download_inputs = []
         for obj in set(list(download_needed.keys()) + list(download_post_needed.keys())):
-            if obj not in coord_lookup:
-                logging.warning(f"Could not find coordinates for object {obj}")
+            if obj not in galaxy_coord_lookup:
+                logging.warning(f"Could not find galaxy catalog coordinates for object {obj}")
                 continue
-            ra, dec = coord_lookup[obj]
+            ra, dec = galaxy_coord_lookup[obj]
 
             obj_norm = normalize_object_id(obj)
             rownum = final_rownum_map.get(obj_norm, obj_norm)
@@ -1002,7 +1105,7 @@ def stage3_pretrigger_magnitude(
 
             date_start = window_start.strftime("%Y-%m-%d")
             date_end = trigger.strftime("%Y-%m-%d")
-            if obj in download_post_needed:
+            if obj in download_post_needed and obj not in download_needed:
                 # The archive query uses an exclusive lower date bound. Search
                 # one day earlier so observations on the trigger date are not
                 # discarded before the exact Python-side window check below.
@@ -1135,13 +1238,21 @@ def stage3_pretrigger_magnitude(
             if not path.exists():
                 continue
             try:
-                record = process_difference_image(path, sigma=sigma, maxiters=maxiters, min_valid_pixel=min_valid_pixel)
+                object_ra, object_dec = coord_lookup.get(object_id, (np.nan, np.nan))
+                image_center = _pixel_coordinates_from_sky(path, object_ra, object_dec)
+                record = process_difference_image(
+                    path,
+                    sigma=sigma,
+                    maxiters=maxiters,
+                    min_valid_pixel=min_valid_pixel,
+                    center_x=image_center[0] if image_center is not None else None,
+                    center_y=image_center[1] if image_center is not None else None,
+                )
                 record_dict = record.__dict__.copy()
             except Exception as exc:
                 image_rows.append({"object_id": object_id, "image_path": str(path), "status": f"error: {exc}"})
                 continue
-            sx, sy = source_center_lookup.get(object_id, (np.nan, np.nan))
-            record_dict.update({"object_id": object_id, "phase": "posttrigger", "source_x_px": sx, "source_y_px": sy})
+            record_dict.update({"object_id": object_id, "phase": "posttrigger"})
             image_rows.append(record_dict)
             if np.isfinite(record_dict.get("mag", np.nan)):
                 post_mags.append(float(record_dict["mag"]))
@@ -1155,13 +1266,21 @@ def stage3_pretrigger_magnitude(
             if not path.exists():
                 continue
             try:
-                record = process_difference_image(path, sigma=sigma, maxiters=maxiters, min_valid_pixel=min_valid_pixel)
+                object_ra, object_dec = coord_lookup.get(object_id, (np.nan, np.nan))
+                image_center = _pixel_coordinates_from_sky(path, object_ra, object_dec)
+                record = process_difference_image(
+                    path,
+                    sigma=sigma,
+                    maxiters=maxiters,
+                    min_valid_pixel=min_valid_pixel,
+                    center_x=image_center[0] if image_center is not None else None,
+                    center_y=image_center[1] if image_center is not None else None,
+                )
                 record_dict = record.__dict__.copy()
             except Exception as exc:
                 image_rows.append({"object_id": object_id, "image_path": str(path), "status": f"error: {exc}"})
                 continue
-            sx, sy = source_center_lookup.get(object_id, (np.nan, np.nan))
-            record_dict.update({"object_id": object_id, "phase": "pretrigger", "source_x_px": sx, "source_y_px": sy})
+            record_dict.update({"object_id": object_id, "phase": "pretrigger"})
             image_rows.append(record_dict)
             pre_records.append(record_dict)
 
@@ -1203,7 +1322,18 @@ def stage3_pretrigger_magnitude(
                 pass_flag = True
                 reason = "no_pretrigger_detections"
 
-        sx, sy = source_center_lookup.get(object_id, (np.nan, np.nan))
+        object_image_records = [
+            record for record in image_rows
+            if normalize_object_id(record.get("object_id", "")) == object_id
+            and np.isfinite(_safe_float(record.get("snr", np.nan)))
+        ]
+        best_image_record = max(
+            object_image_records,
+            key=lambda record: _safe_float(record.get("snr", -np.inf)),
+            default={},
+        )
+        sx = _safe_float(best_image_record.get("source_x_px", np.nan))
+        sy = _safe_float(best_image_record.get("source_y_px", np.nan))
         # detection RA/DEC: prefer coord_lookup, else use median from work
         dra, ddec = (np.nan, np.nan)
         if object_id in coord_lookup:
@@ -1259,7 +1389,11 @@ def stage4_host_mag(stage3_objects: pd.DataFrame, final_class_df: pd.DataFrame, 
             cached_fwhm = pd.to_numeric(cached_host.get("fwhm_px"), errors="coerce")
             fwhm_cache_valid = "fwhm_px" in cached_host.columns and cached_fwhm.notna().all()
             magnitude_cache_valid = {"best_snr_mag", "best_snr_mag_err"}.issubset(cached_host.columns)
-            if cached_ids == current_ids and fwhm_cache_valid and diff_fwhm_cache_valid and magnitude_cache_valid:
+            fwhm_source_cache_valid = (
+                "fwhm_source" in cached_host.columns
+                and cached_host["fwhm_source"].astype(str).eq("stage1_best_snr_centroid").all()
+            )
+            if cached_ids == current_ids and fwhm_cache_valid and diff_fwhm_cache_valid and magnitude_cache_valid and fwhm_source_cache_valid:
                 return cached_host, cached_final
             logging.info(
                 "Recomputing stage4 outputs because cached IDs or diff_fwhm values are stale: %s -> %s",
@@ -1411,32 +1545,44 @@ def stage4_host_mag(stage3_objects: pd.DataFrame, final_class_df: pd.DataFrame, 
         host_offsets.append(compute_host_offset(dra, ddec, hra, hdec))
     final["host_offset_arcsec"] = host_offsets
 
-    # Measure the source width directly from the selected difference image.
+    # Measure the source width from the same stage-1 detection that defines
+    # best_snr. This keeps the image path and SNR centroid paired; stage-3 may
+    # contain a different post-trigger image for the same object.
+    stage1_detection_lookup = {}
+    stage1_images_path = out_root / "stage1" / "april_stage1_quadratic_snr_images.csv"
+    if stage1_images_path.exists():
+        stage1_images = pd.read_csv(stage1_images_path, low_memory=False)
+        required_stage1 = {"object_id", "image_path", "source_x_px", "source_y_px", "snr", "fwhm_px"}
+        if required_stage1.issubset(stage1_images.columns):
+            stage1_images = stage1_images.copy()
+            stage1_images["object_id"] = stage1_images["object_id"].astype(str).map(normalize_object_id)
+            stage1_images["snr"] = pd.to_numeric(stage1_images["snr"], errors="coerce")
+            stage1_images = stage1_images.sort_values("snr", ascending=False).drop_duplicates("object_id")
+            stage1_detection_lookup = stage1_images.set_index("object_id").to_dict("index")
+
     fwhm_values = []
     for _, row in final.iterrows():
-        diff_path = row.get("diff_path")
-        x_px = _safe_float(row.get("detection_x_px", row.get("source_x_px", np.nan)))
-        y_px = _safe_float(row.get("detection_y_px", row.get("source_y_px", np.nan)))
+        stage1_row = stage1_detection_lookup.get(normalize_object_id(row.get("object_id")), {})
+        diff_path = stage1_row.get("image_path", row.get("diff_path"))
+        x_px = _safe_float(stage1_row.get("source_x_px", row.get("detection_x_px", np.nan)))
+        y_px = _safe_float(stage1_row.get("source_y_px", row.get("detection_y_px", np.nan)))
         if not diff_path or not Path(str(diff_path)).exists() or not np.isfinite(x_px) or not np.isfinite(y_px):
             fwhm_values.append(np.nan)
             continue
         fwhm_values.append(measure_fwhm_from_image(Path(str(diff_path)), x_px, y_px, box_size=21))
     final["fwhm_px"] = fwhm_values
+    final["fwhm_source"] = "stage1_best_snr_centroid"
 
     # Copy the stage-1 SEEING/FWHM for the selected difference image.  Stage 2
     # may relocate the file, so match by basename rather than full path.
-    stage1_images_path = out_root / "stage1" / "april_stage1_quadratic_snr_images.csv"
     diff_fwhm_lookup = {}
-    if stage1_images_path.exists():
-        stage1_images = pd.read_csv(stage1_images_path, low_memory=False)
-        if "image_path" in stage1_images.columns and "fwhm_px" in stage1_images.columns:
-            for _, stage1_row in stage1_images.iterrows():
-                image_name = Path(str(stage1_row.get("image_path", ""))).name
-                if image_name:
-                    diff_fwhm_lookup[image_name] = _safe_float(stage1_row.get("fwhm_px"))
+    for stage1_row in stage1_detection_lookup.values():
+        image_name = Path(str(stage1_row.get("image_path", ""))).name
+        if image_name:
+            diff_fwhm_lookup[image_name] = _safe_float(stage1_row.get("fwhm_px"))
 
-    final["diff_fwhm"] = final["diff_path"].map(
-        lambda value: diff_fwhm_lookup.get(Path(str(value)).name, np.nan)
+    final["diff_fwhm"] = final["object_id"].map(
+        lambda value: _safe_float(stage1_detection_lookup.get(normalize_object_id(value), {}).get("fwhm_px", np.nan))
     )
 
     passed = final[final["host_rmag_pass"]].copy()
@@ -1505,6 +1651,35 @@ def save_stage4_results(
         if not triplet_files:
             # fallback: search anywhere for directory matching oid
             triplet_files = list(triplet_root.rglob(f"*{oid}*/triplet.npy"))
+
+        # Each triplet lives in a directory named after its source diff image
+        # (parent dir name == diff_path.stem), which encodes the epoch/filter.
+        # rglob() order is filesystem-dependent and not chronological, so sort
+        # by observation date here -- otherwise "_0", "_1", "_2" in the saved
+        # filenames don't correspond to anything meaningful or reproducible.
+        def _triplet_sort_key(tpath):
+            parsed = parse_diff_name(tpath.parent.name) or {}
+            obs_dt = _parse_filefracday_datetime(parsed.get("filefracday"))
+            return (pd.Timestamp.max if pd.isna(obs_dt) else obs_dt, tpath.parent.name)
+
+        triplet_files = sorted(triplet_files, key=_triplet_sort_key)
+
+        # Record which image each saved index corresponds to, so triplet_norm_0.png
+        # etc. can be traced back to a specific epoch/filter after the fact.
+        triplet_index_rows = []
+        for i, tpath in enumerate(triplet_files[:max_triplets_per_object]):
+            parsed = parse_diff_name(tpath.parent.name) or {}
+            obs_dt = _parse_filefracday_datetime(parsed.get("filefracday"))
+            triplet_index_rows.append({
+                "index": i,
+                "diff_image": tpath.parent.name,
+                "filter": parsed.get("filter", ""),
+                "filefracday": parsed.get("filefracday", ""),
+                "obs_datetime": obs_dt,
+                "triplet_path": str(tpath),
+            })
+        if triplet_index_rows:
+            _pd.DataFrame(triplet_index_rows).to_csv(obj_dir / "triplet_index.csv", index=False)
 
         for i, tpath in enumerate(triplet_files[:max_triplets_per_object]):
             try:
@@ -1577,7 +1752,7 @@ def save_stage4_results(
                     ax2.axis("off")
 
                     # WCS-based cropping centers the SNR source in the diff panels.
-                    if col == 2:
+                    if col == 0 or col == 2:
                         center = display_planes[col].shape[0] // 2
                         gap = 5
                         arm_len = 12
@@ -1743,10 +1918,27 @@ def save_stage4_results(
                         ax.xaxis.set_major_formatter(formatter)
                         fig.autofmt_xdate(rotation=45, ha='right')
 
+                        # ===== CHANGED PART =====
                         if trigger_datetime is not None and pd.notna(trigger_datetime):
-                            ax.axvline(pd.to_datetime(trigger_datetime), color="black", linestyle="--", linewidth=1.2, alpha=0.8, label="Триггер GRB 220219B")
+                            trigger = pd.to_datetime(trigger_datetime)
+                            cutoff = (trigger - pd.Timedelta(days=1)).normalize()
+                            cutoff2 = (trigger + pd.Timedelta(days=7)).normalize()
+
+                            # Discard data older than 1 days before trigger
+                            ssel_plot = ssel_plot[ssel_plot["obs_datetime"] >= cutoff].copy()
+
+                            ax.axvline(trigger, color="black", linestyle="--", linewidth=1.2, alpha=0.8, label="Триггер GRB 220219B")
+
+                        #     ax.set_xlim(left=cutoff, right=cutoff2)
+                        # # =========================
 
                         ax.invert_yaxis()
+                        ax.set_ylim(22.0, 20.0)   # magnitude axis: brighter = higher
+                        ax.set_xlim(
+                            pd.Timestamp("2019-04-24"),
+                            pd.Timestamp("2019-05-03")
+                        )
+
                         ax.set_ylabel("Звёздная величина")
                         ax.set_title(f"Кривая блеска {oid}")
                         ax.legend()
@@ -1787,11 +1979,9 @@ def main(argv: list[str] | None = None) -> int:
     diff_root = resolve_cli_path(config.get("diff_root", "ztf_diff_cutout_imgs_catalog2"))
     sci_root = resolve_cli_path(config.get("sci_root", "ztf_sci_cutout_imgs"))
     ref_root = resolve_cli_path(config.get("ref_root", "ztf_ref_cutout_imgs"))
-    ref_meta_path = resolve_cli_path(config.get("ref_meta", "metadata_ref_best.csv"))
     final_class_csv = resolve_cli_path(config.get("final_class_csv", "final_class_table_new_(only_in_dist_bounds).csv"))
     model_path = resolve_cli_path(config.get("model_path", "braai/models/braai_d6_m9.h5"))
 
-    ref_meta = pd.read_csv(ref_meta_path, low_memory=False)
     final_class_df = pd.read_csv(final_class_csv, low_memory=False)
 
     diff_index = stage0_diff_index(diff_root, out_root, limit_images=int(config.get("limit_images", 0)), object_ids=config.get("object_ids", []), resume=resume)
@@ -1818,9 +2008,7 @@ def main(argv: list[str] | None = None) -> int:
         out_root,
         sci_root=sci_root,
         ref_root=ref_root,
-        ref_meta=ref_meta,
         final_class_df=final_class_df,
-        max_ref_sep_arcsec=float(config.get("max_ref_sep_arcsec", 3.0)),
         download_missing=bool(config.get("download_missing", True)),
         triplet_size=int(config.get("triplet_size", 63)),
         ref_flip_lr=bool(config.get("ref_flip_lr", False)),
