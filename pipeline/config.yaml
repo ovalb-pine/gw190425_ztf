@@ -4,7 +4,7 @@ lookback_days: 10
 posttrigger_days: 10
 snr_threshold: 3.0
 braai_threshold: 0.25
-host_rmag_threshold: 22.5
+host_rmag_threshold: 25.5
 sigma: 3.0
 maxiters: 5
 min_valid_pixel: -4000.0
@@ -18,7 +18,7 @@ sci_root: "../ztf_sci_cutout_imgs"
 ref_root: "../ztf_ref_cutout_imgs"
 ref_meta: "../metadata_ZTF22aabjpxh.csv"
 # final_class_csv: "ZTF22aabjpxh_galaxy_catalog.csv"
-final_class_csv: "numbered_galaxies.csv"
+final_class_csv: "final_class_table_new_(only_in_dist_bounds).csv"
 out_root: "ZTF22aabjpxh_candidate_pipeline_out"
 model_path: "../braai/models/braai_d6_m9.h5"
 

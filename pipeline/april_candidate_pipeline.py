@@ -1934,10 +1934,10 @@ def save_stage4_results(
 
                         ax.invert_yaxis()
                         ax.set_ylim(22.0, 20.0)   # magnitude axis: brighter = higher
-                        ax.set_xlim(
-                            pd.Timestamp("2019-04-24"),
-                            pd.Timestamp("2019-05-03")
-                        )
+                        # ax.set_xlim(
+                        #     pd.Timestamp("2022-02-18"),
+                        #     pd.Timestamp("2022-02-28")
+                        # )
 
                         ax.set_ylabel("Звёздная величина")
                         ax.set_title(f"Кривая блеска {oid}")
