@@ -919,6 +919,42 @@ def build_detection_summary(stage2_scores: pd.DataFrame) -> pd.DataFrame:
     keep_cols = [col for col in keep_cols if col in best.columns]
     return best[keep_cols].reset_index(drop=True)
 
+
+def _build_host_magnitude_candidates() -> list[tuple[str, str, str]]:
+    """Return catalog magnitude candidates in preferred fallback order."""
+    return [
+        ("rmag_SDSS-DR16", "SDSS-DR16", "r"),
+        ("gmag_SDSS-DR16", "SDSS-DR16", "g"),
+        ("imag_SDSS-DR16", "SDSS-DR16", "i"),
+        ("zmag_SDSS-DR16", "SDSS-DR16", "z"),
+        ("umag_SDSS-DR16", "SDSS-DR16", "u"),
+        ("Gmag_GAIA-DR3", "Gaia-DR3", "G"),
+        ("BPmag_GAIA-DR3", "Gaia-DR3", "BP"),
+        ("RPmag_GAIA-DR3", "Gaia-DR3", "RP"),
+        ("GRVSmag_GAIA-DR3", "Gaia-DR3", "GRVS"),
+        ("Bmag_GLADE+", "GLADE+", "B"),
+        ("Bjmag_GLADE+", "GLADE+", "Bj"),
+        ("Jmag_GLADE+", "GLADE+", "J"),
+        ("Hmag_GLADE+", "GLADE+", "H"),
+        ("Kmag_GLADE+", "GLADE+", "K"),
+        ("W1mag_GLADE+", "GLADE+", "W1"),
+        ("W2mag_GLADE+", "GLADE+", "W2"),
+        ("m_J_NED-LVS", "NED-LVS", "J"),
+        ("m_H_NED-LVS", "NED-LVS", "H"),
+        ("m_Ks_NED-LVS", "NED-LVS", "Ks"),
+        ("m_W1_NED-LVS", "NED-LVS", "W1"),
+        ("m_W2_NED-LVS", "NED-LVS", "W2"),
+        ("m_W3_NED-LVS", "NED-LVS", "W3"),
+        ("m_W4_NED-LVS", "NED-LVS", "W4"),
+        ("m_FUV_NED-LVS", "NED-LVS", "FUV"),
+        ("m_NUV_NED-LVS", "NED-LVS", "NUV"),
+        ("W1_CatWISE", "CatWISE", "W1"),
+        ("W2_CatWISE", "CatWISE", "W2"),
+        ("host_rmag", "existing", "r"),
+        ("rmag", "existing", "r"),
+    ]
+
+
 def stage3_pretrigger_magnitude(
     *,
     stage2_objects: pd.DataFrame,
@@ -1389,11 +1425,13 @@ def stage4_host_mag(stage3_objects: pd.DataFrame, final_class_df: pd.DataFrame, 
             cached_fwhm = pd.to_numeric(cached_host.get("fwhm_px"), errors="coerce")
             fwhm_cache_valid = "fwhm_px" in cached_host.columns and cached_fwhm.notna().all()
             magnitude_cache_valid = {"best_snr_mag", "best_snr_mag_err"}.issubset(cached_host.columns)
+            host_mag_metadata_cache_valid = {"host_rmag", "host_rmag_source", "host_rmag_band", "host_rmag_catalog", "host_w1_mag", "host_w2_mag", "host_w1_catalog", "host_w2_catalog", "host_desi_id"}.issubset(cached_host.columns)
+            fwhm_consistency_cache_valid = {"fwhm_px", "diff_fwhm", "fwhm_pass", "fwhm_reason"}.issubset(cached_host.columns)
             fwhm_source_cache_valid = (
                 "fwhm_source" in cached_host.columns
                 and cached_host["fwhm_source"].astype(str).eq("stage1_best_snr_centroid").all()
             )
-            if cached_ids == current_ids and fwhm_cache_valid and diff_fwhm_cache_valid and magnitude_cache_valid and fwhm_source_cache_valid:
+            if cached_ids == current_ids and fwhm_cache_valid and diff_fwhm_cache_valid and fwhm_consistency_cache_valid and magnitude_cache_valid and host_mag_metadata_cache_valid and fwhm_source_cache_valid:
                 return cached_host, cached_final
             logging.info(
                 "Recomputing stage4 outputs because cached IDs or diff_fwhm values are stale: %s -> %s",
@@ -1423,28 +1461,95 @@ def stage4_host_mag(stage3_objects: pd.DataFrame, final_class_df: pd.DataFrame, 
 
     final_id_norm = final["object_id"].astype(str).map(normalize_object_id)
 
-    host_col = None
-    for candidate in ("rmag_SDSS-DR16", "host_rmag", "rmag"):
-        if candidate in final_class_df.columns:
-            host_col = candidate
+    final["host_rmag"] = np.nan
+    final["host_rmag_source"] = "missing"
+    final["host_rmag_catalog"] = pd.Series([None] * len(final), dtype="object")
+    final["host_rmag_band"] = pd.Series([None] * len(final), dtype="object")
+    final["host_w1_mag"] = np.nan
+    final["host_w2_mag"] = np.nan
+    final["host_w1_catalog"] = pd.Series([None] * len(final), dtype="object")
+    final["host_w2_catalog"] = pd.Series([None] * len(final), dtype="object")
+    final["host_desi_id"] = pd.Series([None] * len(final), dtype="object")
+
+    magnitude_lookups: dict[str, dict[str, float]] = {}
+    for column_name, _, _ in _build_host_magnitude_candidates():
+        if column_name not in final_class_df.columns:
+            continue
+        work = final_class_df[["object_id", column_name]].copy()
+        work["object_id"] = work["object_id"].astype(str).map(normalize_object_id)
+        work[column_name] = pd.to_numeric(work[column_name], errors="coerce")
+        magnitude_lookups[column_name] = (
+            work.dropna(subset=[column_name])
+            .drop_duplicates(subset=["object_id"])
+            .set_index("object_id")[column_name]
+            .to_dict()
+        )
+
+    desi_lookup: dict[str, str | None] = {}
+    for desi_column in ("id_DESI-DR8", "objid_DESI-DR8", "objID_DESI-DR8"):
+        if desi_column not in final_class_df.columns:
+            continue
+        work = final_class_df[["object_id", desi_column]].copy()
+        work["object_id"] = work["object_id"].astype(str).map(normalize_object_id)
+        work[desi_column] = work[desi_column].map(lambda value: None if pd.isna(value) else str(value).strip())
+        desi_lookup = (
+            work.dropna(subset=[desi_column])
+            .drop_duplicates(subset=["object_id"])
+            .set_index("object_id")[desi_column]
+            .to_dict()
+        )
+        if desi_lookup:
             break
-    if host_col is None:
-        final["host_rmag"] = np.nan
-        final["host_rmag_source"] = "missing"
-    else:
-        host_index = final_class_df.copy()
-        id_col = "object_id"
-        host_index[id_col] = host_index[id_col].astype(str).map(normalize_object_id)
-        host_index[host_col] = pd.to_numeric(host_index[host_col], errors="coerce")
-        lookup = host_index[[id_col, host_col]].drop_duplicates(subset=[id_col]).set_index(id_col)[host_col]
-        final["host_rmag"] = final_id_norm.map(lookup)
-        final["host_rmag_source"] = np.where(final["host_rmag"].notna(), host_col, "missing")
 
-        lookup = host_index[[id_col, "D_L_fin"]].drop_duplicates(subset=[id_col]).set_index(id_col)["D_L_fin"]
-        final["D_L_fin"] = final_id_norm.map(lookup)
+    for idx, row in final.iterrows():
+        object_id = normalize_object_id(row.get("object_id"))
+        matched_value = np.nan
+        matched_source = "missing"
+        matched_catalog = np.nan
+        matched_band = np.nan
+        catwise_w1 = np.nan
+        catwise_w2 = np.nan
+        catwise_w1_catalog = None
+        catwise_w2_catalog = None
 
-        lookup = host_index[[id_col, "e_D_L_fin"]].drop_duplicates(subset=[id_col]).set_index(id_col)["e_D_L_fin"]
-        final["e_D_L_fin"] = final_id_norm.map(lookup)
+        for column_name, catalog_name, band_name in _build_host_magnitude_candidates():
+            if column_name not in final_class_df.columns:
+                continue
+            candidate_value = magnitude_lookups.get(column_name, {}).get(object_id, np.nan)
+            if pd.notna(candidate_value):
+                if catalog_name == "CatWISE":
+                    if band_name == "W1" and pd.isna(catwise_w1):
+                        catwise_w1 = candidate_value
+                        catwise_w1_catalog = catalog_name
+                    elif band_name == "W2" and pd.isna(catwise_w2):
+                        catwise_w2 = candidate_value
+                        catwise_w2_catalog = catalog_name
+                if pd.isna(matched_value):
+                    matched_value = candidate_value
+                    matched_source = column_name
+                    matched_catalog = catalog_name
+                    matched_band = band_name
+
+        final.at[idx, "host_rmag"] = matched_value
+        final.at[idx, "host_rmag_source"] = matched_source
+        final.at[idx, "host_rmag_catalog"] = matched_catalog
+        final.at[idx, "host_rmag_band"] = matched_band
+        final.at[idx, "host_w1_mag"] = catwise_w1
+        final.at[idx, "host_w2_mag"] = catwise_w2
+        final.at[idx, "host_w1_catalog"] = catwise_w1_catalog
+        final.at[idx, "host_w2_catalog"] = catwise_w2_catalog
+        if pd.isna(matched_value):
+            final.at[idx, "host_desi_id"] = desi_lookup.get(object_id)
+
+    host_index = final_class_df.copy()
+    id_col = "object_id"
+    host_index[id_col] = host_index[id_col].astype(str).map(normalize_object_id)
+
+    lookup = host_index[[id_col, "D_L_fin"]].drop_duplicates(subset=[id_col]).set_index(id_col)["D_L_fin"]
+    final["D_L_fin"] = final_id_norm.map(lookup)
+
+    lookup = host_index[[id_col, "e_D_L_fin"]].drop_duplicates(subset=[id_col]).set_index(id_col)["e_D_L_fin"]
+    final["e_D_L_fin"] = final_id_norm.map(lookup)
 
     host_rmag_numeric = pd.to_numeric(final["host_rmag"], errors="coerce")
     final["host_rmag_pass"] = host_rmag_numeric.le(float(host_rmag_threshold)) | host_rmag_numeric.isna()
@@ -1585,7 +1690,21 @@ def stage4_host_mag(stage3_objects: pd.DataFrame, final_class_df: pd.DataFrame, 
         lambda value: _safe_float(stage1_detection_lookup.get(normalize_object_id(value), {}).get("fwhm_px", np.nan))
     )
 
-    passed = final[final["host_rmag_pass"]].copy()
+    fwhm_px_numeric = pd.to_numeric(final.get("fwhm_px"), errors="coerce")
+    diff_fwhm_numeric = pd.to_numeric(final.get("diff_fwhm"), errors="coerce")
+    fwhm_abs_delta = (fwhm_px_numeric - diff_fwhm_numeric).abs()
+    # Use a conservative tolerance: 0.5 px floor, with a 15% relative allowance
+    # on larger widths so the gate stays tight enough to reject obviously bad
+    # matches without dropping valid measurements due to tiny numerical drift.
+    fwhm_tolerance = np.maximum(1.0, diff_fwhm_numeric.fillna(0) * 0.15)
+    final["fwhm_pass"] = fwhm_px_numeric.notna() & diff_fwhm_numeric.notna() & fwhm_abs_delta.le(fwhm_tolerance)
+    final["fwhm_reason"] = np.where(
+        fwhm_px_numeric.isna() | diff_fwhm_numeric.isna(),
+        "fwhm_missing",
+        np.where(final["fwhm_pass"], "ok", "fwhm_mismatch"),
+    )
+
+    passed = final[final["host_rmag_pass"] & final["fwhm_pass"]].copy()
     write_csv(final, host_objects_path)
     write_csv(passed, final_candidates_path)
     return final, passed
