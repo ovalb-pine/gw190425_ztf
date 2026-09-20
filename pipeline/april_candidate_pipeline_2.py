@@ -143,25 +143,6 @@ def _build_final_rownum_map(final_class_df: pd.DataFrame) -> dict:
     return mapping
 
 
-def _build_object_coordinate_index(final_class_df: pd.DataFrame | None) -> dict[str, tuple[float, float]]:
-    """Index catalog coordinates by both catalog object ID and row-number ID."""
-    if final_class_df is None:
-        return {}
-    index = {str(key): value for key, value in _build_exact_coord_index(final_class_df).items()}
-    ra_columns = ("ra_fin", "RA_fin", "ra_SDSS-DR16", "RA", "ra")
-    dec_columns = ("dec_fin", "DEC_fin", "dec_SDSS-DR16", "DEC", "dec")
-    ra_column = next((column for column in ra_columns if column in final_class_df.columns), None)
-    dec_column = next((column for column in dec_columns if column in final_class_df.columns), None)
-    if ra_column is None or dec_column is None:
-        return index
-    for row_number, (_, row) in enumerate(final_class_df.reset_index(drop=True).iterrows(), start=1):
-        ra = _safe_float(row.get(ra_column))
-        dec = _safe_float(row.get(dec_column))
-        if np.isfinite(ra) and np.isfinite(dec):
-            index.setdefault(str(row_number), (ra, dec))
-    return index
-
-
 def _norm_key_name(name: str) -> str:
     if "__ztf_" in name:
         return name.split("__", 1)[1]
@@ -490,7 +471,6 @@ def stage1_quadratic_snr(
     diff_index: pd.DataFrame,
     out_root: Path,
     *,
-    final_class_df: pd.DataFrame | None = None,
     snr_threshold: float,
     sigma: float,
     maxiters: int,
@@ -504,11 +484,7 @@ def stage1_quadratic_snr(
     if resume:
         cached_images = load_csv_if_exists(images_path)
         cached_objects = load_csv_if_exists(objects_path)
-        if (
-            cached_images is not None
-            and cached_objects is not None
-            and {"centroid_ra", "centroid_dec", "snr_empirical"}.issubset(cached_images.columns)
-        ):
+        if cached_images is not None and cached_objects is not None:
             return cached_images, cached_objects
 
     if diff_index.empty:
@@ -517,62 +493,18 @@ def stage1_quadratic_snr(
         write_csv(empty, objects_path)
         return empty, empty
 
-    coord_index = _build_object_coordinate_index(final_class_df)
-    rows = []
-    for _, image_row in diff_index.iterrows():
-        image_path = Path(str(image_row["image_path"]))
-        object_id = _extract_object_id(image_row.get("object_id", ""))
-        sky_position = coord_index.get(object_id)
-        if sky_position is None:
-            parsed = parse_diff_name(image_path.name) or {}
-            fallback_ra = _safe_float(parsed.get("ra"))
-            fallback_dec = _safe_float(parsed.get("dec"))
-            sky_position = (fallback_ra, fallback_dec) if np.isfinite(fallback_ra) and np.isfinite(fallback_dec) else None
-
-        center = _pixel_coordinates_from_sky(image_path, *sky_position) if sky_position is not None else None
-        try:
-            record = process_difference_image(
-                image_path,
-                sigma=sigma,
-                maxiters=maxiters,
-                min_valid_pixel=min_valid_pixel,
-                center_x=center[0] if center is not None else None,
-                center_y=center[1] if center is not None else None,
-            )
-            record_dict = record.__dict__.copy()
-            centroid_sky = _sky_coordinates_from_pixel(
-                image_path,
-                record_dict.get("source_x_px", np.nan),
-                record_dict.get("source_y_px", np.nan),
-            )
-            if centroid_sky is not None:
-                record_dict["centroid_ra"] = centroid_sky[0]
-                record_dict["centroid_dec"] = centroid_sky[1]
-            record_dict["status"] = "ok"
-        except Exception as exc:
-            record_dict = {"image_path": str(image_path), "status": f"error: {exc}"}
-        rows.append(record_dict)
-    rows = pd.DataFrame(rows)
+    rows = process_difference_images(diff_index["image_path"].tolist(), sigma=sigma, maxiters=maxiters, min_valid_pixel=min_valid_pixel)
     if "image_path" not in rows.columns:
         rows["image_path"] = diff_index["image_path"].values[: len(rows)]
     merged = diff_index.merge(rows, on="image_path", how="left", suffixes=("", "_phot"))
     merged["snr"] = pd.to_numeric(merged.get("snr"), errors="coerce")
-    merged["snr_empirical"] = pd.to_numeric(merged.get("snr_empirical"), errors="coerce")
-    pass_df = merged[merged["snr_empirical"] >= float(snr_threshold)].copy()
+    pass_df = merged[merged["snr"] >= float(snr_threshold)].copy()
 
     summary = (
         pass_df.groupby("object_id", dropna=False)
-        .agg(
-            best_snr_empirical=("snr_empirical", "max"),
-            best_snr_naive=("snr", "max"),
-            n_pass_images=("image_path", "count"),
-            first_obs_date=("filefracday", "min"),
-            last_obs_date=("filefracday", "max"),
-        )
+        .agg(best_snr=("snr", "max"), n_pass_images=("image_path", "count"), first_obs_date=("filefracday", "min"), last_obs_date=("filefracday", "max"))
         .reset_index()
     )
-    # Keep the historical best_snr name, but define it as the empirical metric.
-    summary["best_snr"] = summary["best_snr_empirical"]
 
     write_csv(merged, images_path)
     write_csv(summary, objects_path)
@@ -612,7 +544,7 @@ def stage2_triplets(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     sci_index = build_file_index(sci_root)
     ref_index = build_file_index(ref_root)
-    coord_index = _build_object_coordinate_index(final_class_df)
+    coord_index = _build_exact_coord_index(final_class_df)
 
     # Map object ids to final-class row numbers for file/dir naming
     final_rownum_map = _build_final_rownum_map(final_class_df)
@@ -638,7 +570,7 @@ def stage2_triplets(
     candidate_center_source: dict[str, str] = {}
     if not snr_images.empty:
         ranked = snr_images.copy()
-        ranked["_snr_rank"] = pd.to_numeric(ranked.get("snr_empirical"), errors="coerce").fillna(-np.inf)
+        ranked["_snr_rank"] = pd.to_numeric(ranked.get("snr"), errors="coerce").fillna(-np.inf)
         ranked["_object_id"] = ranked.apply(
             lambda r: _extract_object_id(r.get("object_id", (parse_diff_name(Path(str(r["image_path"])).name) or {}).get("object_id"))),
             axis=1,
@@ -650,12 +582,6 @@ def stage2_triplets(
             obj = best_row["_object_id"]
             best_diff_path = Path(str(best_row["image_path"]))
             best_parsed = parse_diff_name(best_diff_path.name) or {}
-            centroid_ra = _safe_float(best_row.get("centroid_ra", np.nan))
-            centroid_dec = _safe_float(best_row.get("centroid_dec", np.nan))
-            if np.isfinite(centroid_ra) and np.isfinite(centroid_dec):
-                candidate_center_lookup[obj] = (centroid_ra, centroid_dec)
-                candidate_center_source[obj] = "stage1_centroid_wcs"
-                continue
             sx = _safe_float(best_row.get("source_x_px", np.nan))
             sy = _safe_float(best_row.get("source_y_px", np.nan))
             centroid_sky = _sky_coordinates_from_pixel(best_diff_path, sx, sy)
@@ -679,10 +605,6 @@ def stage2_triplets(
     if resume:
         cached_manifest = load_csv_if_exists(manifest_path)
         cached_complete = load_csv_if_exists(objects_path)
-        if cached_manifest is not None and not {"centroid_ra", "centroid_dec"}.issubset(cached_manifest.columns):
-            cached_manifest = None
-        if cached_complete is not None and not {"centroid_ra", "centroid_dec"}.issubset(cached_complete.columns):
-            cached_complete = None
         if cached_manifest is not None:
             manifest_rows.extend(cached_manifest.to_dict("records"))
         if cached_complete is not None:
@@ -948,9 +870,9 @@ def stage2_braai(
     else:
         objects_df = scores_df.iloc[0:0].copy()
     if not scores_df.empty and "image_path" in scores_df.columns:
-        scores_df = scores_df.sort_values([col for col in ["braai_score", "snr_empirical"] if col in scores_df.columns], ascending=[False, False] if "braai_score" in scores_df.columns else True)
+        scores_df = scores_df.sort_values([col for col in ["braai_score", "snr"] if col in scores_df.columns], ascending=[False, False] if "braai_score" in scores_df.columns else True)
     if not objects_df.empty and "image_path" in objects_df.columns:
-        objects_df = objects_df.sort_values([col for col in ["braai_score", "snr_empirical"] if col in objects_df.columns], ascending=[False, False] if "braai_score" in objects_df.columns else True)
+        objects_df = objects_df.sort_values([col for col in ["braai_score", "snr"] if col in objects_df.columns], ascending=[False, False] if "braai_score" in objects_df.columns else True)
     write_csv(scores_df, scores_path)
     write_csv(objects_df, objects_path)
     return scores_df, objects_df
@@ -977,15 +899,14 @@ def build_detection_summary(stage2_scores: pd.DataFrame) -> pd.DataFrame:
     work = stage2_scores.copy()
     work["object_id"] = work["object_id"].astype(str)
     work["braai_score"] = pd.to_numeric(work.get("braai_score"), errors="coerce")
-    work["snr_empirical"] = pd.to_numeric(work.get("snr_empirical"), errors="coerce")
-    sort_cols = [col for col in ["braai_score", "snr_empirical"] if col in work.columns]
+    work["snr"] = pd.to_numeric(work.get("snr"), errors="coerce")
+    sort_cols = [col for col in ["braai_score", "snr"] if col in work.columns]
     if sort_cols:
         work = work.sort_values(sort_cols, ascending=[False] * len(sort_cols))
     best = work.drop_duplicates(subset=["object_id"], keep="first").copy()
     keep_cols = [
         "object_id",
         "braai_score",
-        "snr_empirical",
         "snr",
         "source_x_px",
         "source_y_px",
@@ -997,129 +918,6 @@ def build_detection_summary(stage2_scores: pd.DataFrame) -> pd.DataFrame:
     ]
     keep_cols = [col for col in keep_cols if col in best.columns]
     return best[keep_cols].reset_index(drop=True)
-
-
-def _build_host_magnitude_candidates() -> list[tuple[str, str, str]]:
-    """Return catalog magnitude candidates in preferred fallback order."""
-    return [
-        ("rmag_SDSS-DR16", "SDSS-DR16", "r"),
-        ("gmag_SDSS-DR16", "SDSS-DR16", "g"),
-        ("imag_SDSS-DR16", "SDSS-DR16", "i"),
-        ("zmag_SDSS-DR16", "SDSS-DR16", "z"),
-        ("umag_SDSS-DR16", "SDSS-DR16", "u"),
-        ("Gmag_GAIA-DR3", "Gaia-DR3", "G"),
-        ("BPmag_GAIA-DR3", "Gaia-DR3", "BP"),
-        ("RPmag_GAIA-DR3", "Gaia-DR3", "RP"),
-        ("GRVSmag_GAIA-DR3", "Gaia-DR3", "GRVS"),
-        ("Bmag_GLADE+", "GLADE+", "B"),
-        ("Bjmag_GLADE+", "GLADE+", "Bj"),
-        ("Jmag_GLADE+", "GLADE+", "J"),
-        ("Hmag_GLADE+", "GLADE+", "H"),
-        ("Kmag_GLADE+", "GLADE+", "K"),
-        ("W1mag_GLADE+", "GLADE+", "W1"),
-        ("W2mag_GLADE+", "GLADE+", "W2"),
-        ("m_J_NED-LVS", "NED-LVS", "J"),
-        ("m_H_NED-LVS", "NED-LVS", "H"),
-        ("m_Ks_NED-LVS", "NED-LVS", "Ks"),
-        ("m_W1_NED-LVS", "NED-LVS", "W1"),
-        ("m_W2_NED-LVS", "NED-LVS", "W2"),
-        ("m_W3_NED-LVS", "NED-LVS", "W3"),
-        ("m_W4_NED-LVS", "NED-LVS", "W4"),
-        ("m_FUV_NED-LVS", "NED-LVS", "FUV"),
-        ("m_NUV_NED-LVS", "NED-LVS", "NUV"),
-        ("W1_CatWISE", "CatWISE", "W1"),
-        ("W2_CatWISE", "CatWISE", "W2"),
-        ("host_rmag", "existing", "r"),
-        ("rmag", "existing", "r"),
-    ]
-
-
-def _legacy_flux_to_mag(flux, mw_transmission) -> float:
-    """Convert Legacy Survey tractor flux to an extinction-corrected AB mag."""
-    flux_value = _safe_float(flux)
-    transmission = _safe_float(mw_transmission)
-    if not np.isfinite(flux_value) or flux_value <= 0:
-        return np.nan
-    if not np.isfinite(transmission) or transmission <= 0:
-        transmission = 1.0
-    return float(22.5 - 2.5 * np.log10(flux_value / transmission))
-
-
-def _fetch_legacy_dr9_photometry(
-    ra: float,
-    dec: float,
-    *,
-    radius_deg: float = 0.001,
-    timeout: float = 30.0,
-) -> dict[str, object]:
-    """Return the nearest Legacy Survey DR9 tractor source near a position."""
-    from io import StringIO
-
-    import requests
-
-    result: dict[str, object] = {
-        "legacy_dr9_status": "missing",
-        "legacy_dr9_sep_arcsec": np.nan,
-    }
-    if not np.isfinite(ra) or not np.isfinite(dec):
-        result["legacy_dr9_status"] = "missing_coordinates"
-        return result
-
-    try:
-        # The viewer's historical cat.json route currently returns HTML/500.
-        # Data Lab exposes the same DR9 tractor catalog through anonymous TAP.
-        query = f"""
-            SELECT ra, dec, type, objid, flux_g, flux_r, flux_z,
-                   mw_transmission_g, mw_transmission_r, mw_transmission_z
-            FROM ls_dr9.tractor
-            WHERE ra BETWEEN {float(ra) - radius_deg} AND {float(ra) + radius_deg}
-              AND dec BETWEEN {float(dec) - radius_deg} AND {float(dec) + radius_deg}
-        """
-        response = requests.get(
-            "https://datalab.noirlab.edu/tap/sync",
-            params={"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "csv", "QUERY": query},
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        if not response.text.lstrip().startswith(("ra,", "RA,")):
-            raise RuntimeError(f"Data Lab returned non-CSV response: {response.text[:160]!r}")
-        catalog = pd.read_csv(StringIO(response.text))
-        catalog.columns = [str(column).lower() for column in catalog.columns]
-        sources = catalog.to_dict("records")
-        if catalog.empty:
-            result["legacy_dr9_status"] = "no_source"
-            return result
-
-        def angular_distance(source: dict) -> float:
-            source_ra = _safe_float(source.get("ra"))
-            source_dec = _safe_float(source.get("dec"))
-            if not np.isfinite(source_ra) or not np.isfinite(source_dec):
-                return np.inf
-            dra = (source_ra - ra) * np.cos(np.deg2rad(dec))
-            ddec = source_dec - dec
-            return float(np.hypot(dra, ddec))
-
-        nearest = min(sources, key=angular_distance, default=None)
-        if nearest is None or not np.isfinite(angular_distance(nearest)):
-            result["legacy_dr9_status"] = "no_valid_source"
-            return result
-
-        result.update(
-            {
-                "legacy_dr9_status": "ok",
-                "legacy_dr9_sep_arcsec": angular_distance(nearest) * 3600.0,
-                "legacy_dr9_type": nearest.get("type"),
-                "legacy_dr9_objid": nearest.get("objid"),
-                "legacy_gmag": _legacy_flux_to_mag(nearest.get("flux_g"), nearest.get("mw_transmission_g")),
-                "legacy_rmag": _legacy_flux_to_mag(nearest.get("flux_r"), nearest.get("mw_transmission_r")),
-                "legacy_zmag": _legacy_flux_to_mag(nearest.get("flux_z"), nearest.get("mw_transmission_z")),
-            }
-        )
-    except Exception as exc:
-        logging.warning("Legacy DR9 query failed for RA=%s Dec=%s: %s", ra, dec, exc)
-        result["legacy_dr9_status"] = "request_error"
-    return result
-
 
 def stage3_pretrigger_magnitude(
     *,
@@ -1173,13 +971,7 @@ def stage3_pretrigger_magnitude(
                 {"zg", "zr", "zi"}.issubset(cached_post_filters.get(cached_id, set()))
                 for cached_id in cached_ids
             )
-            if (
-                {"stage1_centroid_ra", "stage1_centroid_dec"}.issubset(cached_objects.columns)
-                and "snr_empirical" in cached_images.columns
-                and "pretrigger_mag_pass" in cached_objects.columns
-                and cached_objects["pretrigger_mag_pass"].any()
-                and cache_has_all_filters
-            ):
+            if "pretrigger_mag_pass" in cached_objects.columns and cached_objects["pretrigger_mag_pass"].any() and cache_has_all_filters:
                 passed = cached_objects[cached_objects["pretrigger_mag_pass"]].copy()
                 return cached_images, cached_objects, passed
             logging.info("Recomputing stage3 pre-trigger analysis because cached outputs contain no passing candidates")
@@ -1231,9 +1023,9 @@ def stage3_pretrigger_magnitude(
             if obj not in diff_path_lookup or (np.isfinite(row_score) and row_score > best_score):
                 diff_path_lookup[obj] = row_diff_path
                 best_braai_seen[obj] = row_score if np.isfinite(row_score) else best_score
-        # Reuse the stage-1 centroid sky position when available.
-        ra = _safe_float(row.get("centroid_ra", row.get("ra_used", row.get("ra", np.nan))))
-        dec = _safe_float(row.get("centroid_dec", row.get("dec_used", row.get("dec", np.nan))))
+        # Use ra_used/dec_used if available, else fallback to ra/dec
+        ra = _safe_float(row.get("ra_used", row.get("ra", np.nan)))
+        dec = _safe_float(row.get("dec_used", row.get("dec", np.nan)))
         if np.isfinite(ra) and np.isfinite(dec):
             coord_lookup[obj] = (ra, dec)
         else:
@@ -1269,7 +1061,7 @@ def stage3_pretrigger_magnitude(
     # which detection happens to be "best" in a given run. coord_lookup (built
     # above from ra_used/dec_used) is still used later for reporting the actual
     # measured detection position; it must not be used to choose download centers.
-    galaxy_coord_lookup = _build_object_coordinate_index(final_class_df)
+    galaxy_coord_lookup = _build_exact_coord_index(final_class_df)
 
     # Identify objects that need pre-trigger downloads and post-trigger downloads.
     # Post-trigger coverage is checked independently for each g/r/i filter,
@@ -1533,11 +1325,11 @@ def stage3_pretrigger_magnitude(
         object_image_records = [
             record for record in image_rows
             if normalize_object_id(record.get("object_id", "")) == object_id
-            and np.isfinite(_safe_float(record.get("snr_empirical", np.nan)))
+            and np.isfinite(_safe_float(record.get("snr", np.nan)))
         ]
         best_image_record = max(
             object_image_records,
-            key=lambda record: _safe_float(record.get("snr_empirical", -np.inf)),
+            key=lambda record: _safe_float(record.get("snr", -np.inf)),
             default={},
         )
         sx = _safe_float(best_image_record.get("source_x_px", np.nan))
@@ -1569,8 +1361,6 @@ def stage3_pretrigger_magnitude(
             "source_y_px": sy,
             "detection_ra": dra,
             "detection_dec": ddec,
-            "stage1_centroid_ra": coord_lookup.get(object_id, (np.nan, np.nan))[0],
-            "stage1_centroid_dec": coord_lookup.get(object_id, (np.nan, np.nan))[1],
             "diff_path": diff_path_lookup.get(object_id, ""),
         })
 
@@ -1599,17 +1389,11 @@ def stage4_host_mag(stage3_objects: pd.DataFrame, final_class_df: pd.DataFrame, 
             cached_fwhm = pd.to_numeric(cached_host.get("fwhm_px"), errors="coerce")
             fwhm_cache_valid = "fwhm_px" in cached_host.columns and cached_fwhm.notna().all()
             magnitude_cache_valid = {"best_snr_mag", "best_snr_mag_err"}.issubset(cached_host.columns)
-            host_mag_metadata_cache_valid = {"host_rmag", "host_rmag_source", "host_rmag_band", "host_rmag_catalog", "host_w1_mag", "host_w2_mag", "host_w1_catalog", "host_w2_catalog", "host_desi_id"}.issubset(cached_host.columns)
-            legacy_dr9_cache_valid = (
-                {"legacy_dr9_status", "legacy_dr9_sep_arcsec", "legacy_gmag", "legacy_rmag", "legacy_zmag", "legacy_dr9_type", "legacy_dr9_objid"}.issubset(cached_host.columns)
-                and not cached_host["legacy_dr9_status"].astype(str).eq("request_error").any()
-            )
-            fwhm_consistency_cache_valid = {"fwhm_px", "diff_fwhm", "fwhm_pass", "fwhm_reason"}.issubset(cached_host.columns)
             fwhm_source_cache_valid = (
                 "fwhm_source" in cached_host.columns
                 and cached_host["fwhm_source"].astype(str).eq("stage1_best_snr_centroid").all()
             )
-            if cached_ids == current_ids and fwhm_cache_valid and diff_fwhm_cache_valid and fwhm_consistency_cache_valid and magnitude_cache_valid and host_mag_metadata_cache_valid and legacy_dr9_cache_valid and fwhm_source_cache_valid:
+            if cached_ids == current_ids and fwhm_cache_valid and diff_fwhm_cache_valid and magnitude_cache_valid and fwhm_source_cache_valid:
                 return cached_host, cached_final
             logging.info(
                 "Recomputing stage4 outputs because cached IDs or diff_fwhm values are stale: %s -> %s",
@@ -1639,95 +1423,28 @@ def stage4_host_mag(stage3_objects: pd.DataFrame, final_class_df: pd.DataFrame, 
 
     final_id_norm = final["object_id"].astype(str).map(normalize_object_id)
 
-    final["host_rmag"] = np.nan
-    final["host_rmag_source"] = "missing"
-    final["host_rmag_catalog"] = pd.Series([None] * len(final), dtype="object")
-    final["host_rmag_band"] = pd.Series([None] * len(final), dtype="object")
-    final["host_w1_mag"] = np.nan
-    final["host_w2_mag"] = np.nan
-    final["host_w1_catalog"] = pd.Series([None] * len(final), dtype="object")
-    final["host_w2_catalog"] = pd.Series([None] * len(final), dtype="object")
-    final["host_desi_id"] = pd.Series([None] * len(final), dtype="object")
-
-    magnitude_lookups: dict[str, dict[str, float]] = {}
-    for column_name, _, _ in _build_host_magnitude_candidates():
-        if column_name not in final_class_df.columns:
-            continue
-        work = final_class_df[["object_id", column_name]].copy()
-        work["object_id"] = work["object_id"].astype(str).map(normalize_object_id)
-        work[column_name] = pd.to_numeric(work[column_name], errors="coerce")
-        magnitude_lookups[column_name] = (
-            work.dropna(subset=[column_name])
-            .drop_duplicates(subset=["object_id"])
-            .set_index("object_id")[column_name]
-            .to_dict()
-        )
-
-    desi_lookup: dict[str, str | None] = {}
-    for desi_column in ("id_DESI-DR8", "objid_DESI-DR8", "objID_DESI-DR8"):
-        if desi_column not in final_class_df.columns:
-            continue
-        work = final_class_df[["object_id", desi_column]].copy()
-        work["object_id"] = work["object_id"].astype(str).map(normalize_object_id)
-        work[desi_column] = work[desi_column].map(lambda value: None if pd.isna(value) else str(value).strip())
-        desi_lookup = (
-            work.dropna(subset=[desi_column])
-            .drop_duplicates(subset=["object_id"])
-            .set_index("object_id")[desi_column]
-            .to_dict()
-        )
-        if desi_lookup:
+    host_col = None
+    for candidate in ("rmag_SDSS-DR16", "host_rmag", "rmag"):
+        if candidate in final_class_df.columns:
+            host_col = candidate
             break
+    if host_col is None:
+        final["host_rmag"] = np.nan
+        final["host_rmag_source"] = "missing"
+    else:
+        host_index = final_class_df.copy()
+        id_col = "object_id"
+        host_index[id_col] = host_index[id_col].astype(str).map(normalize_object_id)
+        host_index[host_col] = pd.to_numeric(host_index[host_col], errors="coerce")
+        lookup = host_index[[id_col, host_col]].drop_duplicates(subset=[id_col]).set_index(id_col)[host_col]
+        final["host_rmag"] = final_id_norm.map(lookup)
+        final["host_rmag_source"] = np.where(final["host_rmag"].notna(), host_col, "missing")
 
-    for idx, row in final.iterrows():
-        object_id = normalize_object_id(row.get("object_id"))
-        matched_value = np.nan
-        matched_source = "missing"
-        matched_catalog = np.nan
-        matched_band = np.nan
-        catwise_w1 = np.nan
-        catwise_w2 = np.nan
-        catwise_w1_catalog = None
-        catwise_w2_catalog = None
+        lookup = host_index[[id_col, "D_L_fin"]].drop_duplicates(subset=[id_col]).set_index(id_col)["D_L_fin"]
+        final["D_L_fin"] = final_id_norm.map(lookup)
 
-        for column_name, catalog_name, band_name in _build_host_magnitude_candidates():
-            if column_name not in final_class_df.columns:
-                continue
-            candidate_value = magnitude_lookups.get(column_name, {}).get(object_id, np.nan)
-            if pd.notna(candidate_value):
-                if catalog_name == "CatWISE":
-                    if band_name == "W1" and pd.isna(catwise_w1):
-                        catwise_w1 = candidate_value
-                        catwise_w1_catalog = catalog_name
-                    elif band_name == "W2" and pd.isna(catwise_w2):
-                        catwise_w2 = candidate_value
-                        catwise_w2_catalog = catalog_name
-                if pd.isna(matched_value):
-                    matched_value = candidate_value
-                    matched_source = column_name
-                    matched_catalog = catalog_name
-                    matched_band = band_name
-
-        final.at[idx, "host_rmag"] = matched_value
-        final.at[idx, "host_rmag_source"] = matched_source
-        final.at[idx, "host_rmag_catalog"] = matched_catalog
-        final.at[idx, "host_rmag_band"] = matched_band
-        final.at[idx, "host_w1_mag"] = catwise_w1
-        final.at[idx, "host_w2_mag"] = catwise_w2
-        final.at[idx, "host_w1_catalog"] = catwise_w1_catalog
-        final.at[idx, "host_w2_catalog"] = catwise_w2_catalog
-        if pd.isna(matched_value):
-            final.at[idx, "host_desi_id"] = desi_lookup.get(object_id)
-
-    host_index = final_class_df.copy()
-    id_col = "object_id"
-    host_index[id_col] = host_index[id_col].astype(str).map(normalize_object_id)
-
-    lookup = host_index[[id_col, "D_L_fin"]].drop_duplicates(subset=[id_col]).set_index(id_col)["D_L_fin"]
-    final["D_L_fin"] = final_id_norm.map(lookup)
-
-    lookup = host_index[[id_col, "e_D_L_fin"]].drop_duplicates(subset=[id_col]).set_index(id_col)["e_D_L_fin"]
-    final["e_D_L_fin"] = final_id_norm.map(lookup)
+        lookup = host_index[[id_col, "e_D_L_fin"]].drop_duplicates(subset=[id_col]).set_index(id_col)["e_D_L_fin"]
+        final["e_D_L_fin"] = final_id_norm.map(lookup)
 
     host_rmag_numeric = pd.to_numeric(final["host_rmag"], errors="coerce")
     final["host_rmag_pass"] = host_rmag_numeric.le(float(host_rmag_threshold)) | host_rmag_numeric.isna()
@@ -1760,9 +1477,8 @@ def stage4_host_mag(stage3_objects: pd.DataFrame, final_class_df: pd.DataFrame, 
     lookup_df["object_id"] = lookup_df["object_id"].astype(str).map(normalize_object_id)
 
     # 2. Reduce to the maximum best_snr per object_id (many rows per object possible)
-    snr_column = "best_snr_empirical" if "best_snr_empirical" in lookup_df.columns else "best_snr"
-    lookup_df[snr_column] = pd.to_numeric(lookup_df.get(snr_column), errors="coerce")
-    snr_lookup = lookup_df.groupby("object_id", sort=False)[snr_column].max()
+    lookup_df["best_snr"] = pd.to_numeric(lookup_df.get("best_snr"), errors="coerce")
+    snr_lookup = lookup_df.groupby("object_id", sort=False)["best_snr"].max()
 
     # 3. Map the per-object maximum SNR into the final DataFrame
     final["best_snr"] = pd.to_numeric(final_id_norm.map(snr_lookup), errors="coerce")
@@ -1773,14 +1489,14 @@ def stage4_host_mag(stage3_objects: pd.DataFrame, final_class_df: pd.DataFrame, 
     best_snr_mag_lookup = {}
     if stage3_images_path.exists():
         stage3_images = pd.read_csv(stage3_images_path, low_memory=False)
-        required_columns = {"object_id", "snr_empirical", "mag", "mag_err"}
+        required_columns = {"object_id", "snr", "mag", "mag_err"}
         if required_columns.issubset(stage3_images.columns):
             stage3_images = stage3_images.copy()
             stage3_images["object_id"] = stage3_images["object_id"].astype(str).map(normalize_object_id)
-            stage3_images["snr_empirical"] = pd.to_numeric(stage3_images["snr_empirical"], errors="coerce")
+            stage3_images["snr"] = pd.to_numeric(stage3_images["snr"], errors="coerce")
             stage3_images["mag"] = pd.to_numeric(stage3_images["mag"], errors="coerce")
             stage3_images["mag_err"] = pd.to_numeric(stage3_images["mag_err"], errors="coerce")
-            best_stage3_rows = stage3_images.sort_values("snr_empirical", ascending=False).drop_duplicates("object_id")
+            best_stage3_rows = stage3_images.sort_values("snr", ascending=False).drop_duplicates("object_id")
             best_snr_mag_lookup = best_stage3_rows.set_index("object_id")[["mag", "mag_err"]].to_dict("index")
 
     final["best_snr_mag"] = final_id_norm.map(lambda value: best_snr_mag_lookup.get(value, {}).get("mag", np.nan))
@@ -1836,12 +1552,12 @@ def stage4_host_mag(stage3_objects: pd.DataFrame, final_class_df: pd.DataFrame, 
     stage1_images_path = out_root / "stage1" / "april_stage1_quadratic_snr_images.csv"
     if stage1_images_path.exists():
         stage1_images = pd.read_csv(stage1_images_path, low_memory=False)
-        required_stage1 = {"object_id", "image_path", "source_x_px", "source_y_px", "snr_empirical", "fwhm_px"}
+        required_stage1 = {"object_id", "image_path", "source_x_px", "source_y_px", "snr", "fwhm_px"}
         if required_stage1.issubset(stage1_images.columns):
             stage1_images = stage1_images.copy()
             stage1_images["object_id"] = stage1_images["object_id"].astype(str).map(normalize_object_id)
-            stage1_images["snr_empirical"] = pd.to_numeric(stage1_images["snr_empirical"], errors="coerce")
-            stage1_images = stage1_images.sort_values("snr_empirical", ascending=False).drop_duplicates("object_id")
+            stage1_images["snr"] = pd.to_numeric(stage1_images["snr"], errors="coerce")
+            stage1_images = stage1_images.sort_values("snr", ascending=False).drop_duplicates("object_id")
             stage1_detection_lookup = stage1_images.set_index("object_id").to_dict("index")
 
     fwhm_values = []
@@ -1869,51 +1585,7 @@ def stage4_host_mag(stage3_objects: pd.DataFrame, final_class_df: pd.DataFrame, 
         lambda value: _safe_float(stage1_detection_lookup.get(normalize_object_id(value), {}).get("fwhm_px", np.nan))
     )
 
-    fwhm_px_numeric = pd.to_numeric(final.get("fwhm_px"), errors="coerce")
-    diff_fwhm_numeric = pd.to_numeric(final.get("diff_fwhm"), errors="coerce")
-    fwhm_abs_delta = (fwhm_px_numeric - diff_fwhm_numeric).abs()
-    # Use a conservative tolerance: 0.5 px floor, with a 15% relative allowance
-    # on larger widths so the gate stays tight enough to reject obviously bad
-    # matches without dropping valid measurements due to tiny numerical drift.
-    fwhm_tolerance = np.maximum(1.0, diff_fwhm_numeric.fillna(0) * 0.15)
-    final["fwhm_pass"] = fwhm_px_numeric.notna() & diff_fwhm_numeric.notna() & fwhm_abs_delta.le(fwhm_tolerance)
-    final["fwhm_reason"] = np.where(
-        fwhm_px_numeric.isna() | diff_fwhm_numeric.isna(),
-        "fwhm_missing",
-        np.where(final["fwhm_pass"], "ok", "fwhm_mismatch"),
-    )
-
-    passed = final[final["fwhm_pass"]].copy()
-    legacy_columns = {
-        "legacy_dr9_status": "missing",
-        "legacy_dr9_sep_arcsec": np.nan,
-        "legacy_dr9_type": None,
-        "legacy_dr9_objid": None,
-        "legacy_gmag": np.nan,
-        "legacy_rmag": np.nan,
-        "legacy_zmag": np.nan,
-    }
-    for column, default in legacy_columns.items():
-        final[column] = default
-
-    # Legacy photometry is only needed for the final FWHM-selected candidates.
-    # Prefer catalog coordinates, then fall back to the measured detection position.
-    for idx in passed.index:
-        query_ra = _safe_float(host_ra.loc[idx] if host_ra is not None else np.nan)
-        query_dec = _safe_float(host_dec.loc[idx] if host_dec is not None else np.nan)
-        if not np.isfinite(query_ra) or not np.isfinite(query_dec):
-            query_ra = _safe_float(detection_ra.loc[idx] if detection_ra is not None else np.nan)
-            query_dec = _safe_float(detection_dec.loc[idx] if detection_dec is not None else np.nan)
-        legacy = _fetch_legacy_dr9_photometry(query_ra, query_dec)
-        for column, value in legacy.items():
-            final.at[idx, column] = value
-        if pd.isna(final.at[idx, "host_rmag"]) and pd.notna(final.at[idx, "legacy_rmag"]):
-            final.at[idx, "host_rmag"] = final.at[idx, "legacy_rmag"]
-            final.at[idx, "host_rmag_source"] = "Legacy Survey DR9"
-            final.at[idx, "host_rmag_catalog"] = "Legacy Survey DR9"
-            final.at[idx, "host_rmag_band"] = "r"
-
-    passed = final.loc[passed.index].copy()
+    passed = final[final["host_rmag_pass"]].copy()
     write_csv(final, host_objects_path)
     write_csv(passed, final_candidates_path)
     return final, passed
@@ -2154,7 +1826,7 @@ def save_stage4_results(
                     ssel["mag"] = _pd.to_numeric(ssel.get("mag"), errors="coerce")
                     ssel["mag_err"] = _pd.to_numeric(ssel.get("mag_err"), errors="coerce")
                     ssel["upper_limit"] = _pd.to_numeric(ssel.get("upper_limit"), errors="coerce")
-                    ssel["snr_empirical"] = _pd.to_numeric(ssel.get("snr_empirical"), errors="coerce")
+                    ssel["snr"] = _pd.to_numeric(ssel.get("snr"), errors="coerce")
 
                     # Extract filefracday-derived fractional day for plotting (day-of-year + fraction)
                     def _extract_t_frac(pth):
@@ -2228,7 +1900,7 @@ def save_stage4_results(
                         for filt, color in filter_colors.items():
                             mask_f = ssel_plot["filt"] == filt
                             if mask_f.any():
-                                det = ssel_plot[mask_f & ssel_plot["mag"].notna() & (ssel_plot["snr_empirical"] >= 3)]
+                                det = ssel_plot[mask_f & ssel_plot["mag"].notna() & (ssel_plot["snr"] >= 3)]
                                 if not det.empty:
                                     ax.errorbar(det["obs_datetime"].values, det["mag"].values, yerr=det.get("mag_err"), fmt="o", color=color, label=f"Обнаружение ({filt})")
                                 ul = ssel_plot[mask_f & ssel_plot["upper_limit"].notna()]
@@ -2320,14 +1992,13 @@ def main(argv: list[str] | None = None) -> int:
     stage1_images, stage1_objects = stage1_quadratic_snr(
         diff_index,
         out_root,
-        final_class_df=final_class_df,
         snr_threshold=float(config.get("snr_threshold", 3.0)),
         sigma=float(config.get("sigma", 3.0)),
         maxiters=int(config.get("maxiters", 5)),
         min_valid_pixel=float(config.get("min_valid_pixel", -5000.0)),
         resume=resume,
     )
-    stage1_pass = stage1_images[pd.to_numeric(stage1_images.get("snr_empirical"), errors="coerce") >= float(config.get("snr_threshold", 3.0))].copy()
+    stage1_pass = stage1_images[pd.to_numeric(stage1_images.get("snr"), errors="coerce") >= float(config.get("snr_threshold", 3.0))].copy()
     if stage1_pass.empty:
         logging.warning("No candidates passed the SNR threshold")
         return 0

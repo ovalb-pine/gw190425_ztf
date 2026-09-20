@@ -1,0 +1,53 @@
+# Local Python environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Local editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Secrets and local configuration overrides
+.env
+.env.*
+!.env.example
+*.secret
+
+# Astronomy data and trained model artifacts
+/braai/
+*.fits
+*.fits.fz
+*.fit
+*.h5
+*.weights.h5
+ztf_diff_cutout_imgs_catalog2/
+ztf_sci_cutout_imgs/
+ztf_ref_cutout_imgs/
+diff_*/
+sci_*/
+ref_*/
+*_downloads/
+
+# Pipeline caches, logs, plots, and generated results
+*.progress.json
+*.log
+pipeline/*_candidate_pipeline_out*/
+pipeline/*_pipeline_out*/
+pipeline/stage3/
+pipeline/stage4/
+pipeline/ztf_downloads/stage1_random_spots_zscale.png
+pipeline/ztf_downloads/*_out.csv
+
+# Generated catalog tables and local exports
+*.csv
+!pipeline/tests/**/*.csv
+!pipeline/config*.yaml

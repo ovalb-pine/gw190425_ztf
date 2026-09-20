@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import argparse
 import glob
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+import re
 
 import numpy as np
 import pandas as pd
@@ -26,6 +28,12 @@ from photutils.centroids import centroid_quadratic
 
 
 FWHM_HEADER_KEYS = ("SEEING", "FWHM", "FWHM_PX", "PSF_FWHM")
+
+_NAME_PAT = re.compile(
+    r"(?P<object_id>\d+)_RA(?P<ra>[-+\d\.]+)_DEC(?P<dec>[-+\d\.]+)_"
+    r"(?P<filter>z[gri])_(?P<filefracday>\d+)__ztf_\d+_"
+    r"(?P<field>\d{6})_(?P<filter2>z[gri])_c(?P<ccdid>\d+)_o_q(?P<qid>\d)_scimrefdiffimg"
+)
 
 
 def first_2d_data_and_header(img_path: Path):
@@ -153,6 +161,92 @@ def _conservative_centroid(
     return float(result_x), float(result_y)
 
 
+def _sample_null_apertures(
+    data: np.ndarray,
+    seed_x: float,
+    seed_y: float,
+    ap_r: float,
+    fwhm_px: float,
+    background_median: float,
+    aperture_area_px: float,
+    n_samples: int = 100,
+    min_sep_fwhm: float = 4.0,
+    max_sep_fwhm: float = 12.0,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """Build an empirical null distribution of net flux at off-source positions.
+
+    Critically, each null measurement is run through the *same* biased procedure
+    as the on-source one: seed a position, let ``_conservative_centroid`` snap to
+    the local peak, then do aperture photometry there. Because ``centroid_quadratic``
+    always finds *some* local maximum, comparing the on-source flux to a naive
+    Gaussian sigma is unfair -- it ignores that the position itself was chosen by
+    searching for a peak. Sampling many off-source, source-free locations with the
+    identical peak-searching procedure captures that selection bias directly, so
+    the resulting distribution is a fair baseline: "how much net flux does this
+    same peak-picking algorithm manufacture out of pure background alone?"
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    h, w = data.shape
+    pad = ap_r * 2.0
+    fluxes = []
+    attempts = 0
+    max_attempts = n_samples * 20
+
+    while len(fluxes) < n_samples and attempts < max_attempts:
+        attempts += 1
+        angle = rng.uniform(0.0, 2.0 * np.pi)
+        sep = rng.uniform(min_sep_fwhm, max_sep_fwhm) * fwhm_px
+        x = seed_x + sep * np.cos(angle)
+        y = seed_y + sep * np.sin(angle)
+        if not (pad <= x <= (w - 1 - pad) and pad <= y <= (h - 1 - pad)):
+            continue
+
+        cx, cy = _conservative_centroid(data, x, y, fwhm_px, max_shift_fwhm=3.0)
+        aperture = CircularAperture([(cx, cy)], r=ap_r)
+        ap_tbl = aperture_photometry(data, aperture)
+        aperture_sum = float(np.asarray(ap_tbl["aperture_sum"])[0])
+        fluxes.append(aperture_sum - background_median * aperture_area_px)
+
+    return np.asarray(fluxes, dtype=float)
+
+
+def _empirical_significance(
+    net_flux: float,
+    null_net_flux: np.ndarray,
+    sigma_clip_sigma: float = 3.0,
+    sigma_clip_maxiters: int = 5,
+) -> tuple[float, float, float, float, int]:
+    """Compare an on-source net flux to an empirical off-source null distribution.
+
+    Returns (null_median, null_std, snr_empirical, p_value_empirical, n_used).
+    The null stats are themselves sigma-clipped so that a stray real neighbor
+    landing in one of the null apertures doesn't inflate the spread.
+    ``p_value_empirical`` is the fraction of null draws that equal or exceed the
+    observed flux -- a distribution-free check that doesn't assume the
+    (peak-picking-biased) null is Gaussian.
+    """
+    n = int(np.isfinite(null_net_flux).sum())
+    if n < 10:
+        return np.nan, np.nan, np.nan, np.nan, n
+
+    finite_null = null_net_flux[np.isfinite(null_net_flux)]
+    _, null_median, null_std = sigma_clipped_stats(
+        finite_null, sigma=sigma_clip_sigma, maxiters=sigma_clip_maxiters
+    )
+
+    if np.isfinite(null_std) and null_std > 0:
+        snr_empirical = float((net_flux - null_median) / null_std)
+    else:
+        snr_empirical = np.nan
+
+    p_value_empirical = float(np.mean(finite_null >= net_flux))
+
+    return float(null_median), float(null_std), snr_empirical, p_value_empirical, n
+
+
 def _global_sigma_clipped_background_stats(
     data: np.ndarray,
     cx: float,
@@ -203,11 +297,47 @@ def _extract_fwhm_px(header, keys: Iterable[str] = FWHM_HEADER_KEYS) -> tuple[fl
     raise ValueError(f"Could not find a valid FWHM/seeing value in header keys: {', '.join(keys)}")
 
 
+def parse_image_name(name: str):
+    """Parse the standard ZTF diff-image filename into key metadata."""
+    match = _NAME_PAT.search(name)
+    if not match:
+        return None
+    return {
+        "object_id": match.group("object_id"),
+        "ra": float(match.group("ra")),
+        "dec": float(match.group("dec")),
+        "filter": match.group("filter"),
+        "filefracday": match.group("filefracday"),
+        "field": int(match.group("field")),
+        "ccdid": int(match.group("ccdid")),
+        "qid": int(match.group("qid")),
+    }
+
+
+def _extract_zero_point(header: dict) -> float:
+    for key in ("MAGZP", "MAGZERO", "ZP", "ZEROPT", "ZEROPNT"):
+        try:
+            zp = float(header.get(key))
+        except Exception:
+            continue
+        if np.isfinite(zp):
+            return float(zp)
+    return np.nan
+
+
 @dataclass
 class DifferenceImageSNR:
     image_path: str
     source_x_px: float
     source_y_px: float
+    object_id: str
+    ra: float
+    dec: float
+    filter: str
+    filefracday: str
+    field: int
+    ccdid: int
+    qid: int
     fwhm_px: float
     fwhm_header_key: str
     aperture_radius_px: float
@@ -219,6 +349,17 @@ class DifferenceImageSNR:
     net_flux: float
     flux_err: float
     snr: float
+    null_flux_median: float
+    null_flux_std: float
+    n_null_apertures: int
+    snr_empirical: float
+    p_value_empirical: float
+    significance_tier: str
+    mag: float
+    mag_err: float
+    upper_limit: float
+    detection: bool
+    zero_point: float
     pixel_scale_arcsec_per_px: float
 
 
@@ -229,6 +370,18 @@ def process_difference_image(
     sigma: float = 3.0,
     maxiters: int = 5,
     min_valid_pixel: float = -5000.0,
+    center_x: float | None = None,
+    center_y: float | None = None,
+    n_null_apertures: int = 100,
+    n_null_apertures_refine: int = 400,
+    refine_near_boundary: bool = True,
+    refine_low: float = 2.0,
+    refine_high: float = 6.0,
+    marginal_snr_threshold: float = 3.0,
+    secure_snr_threshold: float = 5.0,
+    null_min_sep_fwhm: float = 4.0,
+    null_max_sep_fwhm: float = 12.0,
+    null_seed: int | None = None,
     **kwargs,
 ):
     """Measure SNR for one ZTF difference image.
@@ -250,8 +403,10 @@ def process_difference_image(
     fwhm_px, fwhm_key = _extract_fwhm_px(header)
     aperture_radius_px = 2.0 * fwhm_px
 
-    center_x = (data.shape[1] - 1) / 2.0
-    center_y = (data.shape[0] - 1) / 2.0
+    if center_x is None or not np.isfinite(center_x):
+        center_x = (data.shape[1] - 1) / 2.0
+    if center_y is None or not np.isfinite(center_y):
+        center_y = (data.shape[0] - 1) / 2.0
     source_x_px, source_y_px = _conservative_centroid(
         data, center_x, center_y, fwhm_px, max_shift_fwhm=3.0
     )
@@ -282,10 +437,114 @@ def process_difference_image(
     flux_err = float(np.sqrt(aperture_area_px) * background_std) if np.isfinite(background_std) else np.nan
     snr = float(net_flux / flux_err) if np.isfinite(flux_err) and flux_err > 0 else np.nan
 
+    # Empirical null test: does this same peak-picking procedure manufacture
+    # comparable net flux out of pure background at off-source positions? This
+    # is what actually decides `detection` -- the naive `snr` above compares to
+    # a background sigma that doesn't account for source_x_px/source_y_px having
+    # been chosen by searching for a peak, and is kept only as a diagnostic field.
+    rng = np.random.default_rng(null_seed) if null_seed is not None else np.random.default_rng(
+        abs(hash(str(p))) % (2**32)
+    )
+
+    def _run_null(n_samples: int, seed_rng: np.random.Generator):
+        flux = _sample_null_apertures(
+            data,
+            center_x,
+            center_y,
+            aperture_radius_px,
+            fwhm_px,
+            background_median,
+            aperture_area_px,
+            n_samples=n_samples,
+            min_sep_fwhm=null_min_sep_fwhm,
+            max_sep_fwhm=null_max_sep_fwhm,
+            rng=seed_rng,
+        )
+        return _empirical_significance(net_flux, flux, sigma_clip_sigma=sigma, sigma_clip_maxiters=maxiters)
+
+    null_flux_median, null_flux_std, snr_empirical, p_value_empirical, n_null_apertures_used = _run_null(
+        n_null_apertures, rng
+    )
+
+    # The 3-5 sigma band is exactly the science-critical regime for this pipeline
+    # (faint transients), and it's also exactly where a modest null sample (~100)
+    # has the most sampling uncertainty on its own std -- a borderline call here
+    # could flip either way just from null-sampling noise, not from the actual
+    # source. So: for candidates landing near this boundary, spend extra null
+    # draws to pin down snr_empirical more precisely, rather than paying that
+    # cost uniformly on every image (most of which aren't borderline at all).
+    if refine_near_boundary and np.isfinite(snr_empirical) and (
+        refine_low <= snr_empirical <= refine_high
+    ):
+        null_flux_median, null_flux_std, snr_empirical, p_value_empirical, n_null_apertures_used = _run_null(
+            n_null_apertures_refine, rng
+        )
+
+    if np.isfinite(snr_empirical):
+        if snr_empirical >= secure_snr_threshold:
+            significance_tier = "secure"
+        elif snr_empirical >= marginal_snr_threshold:
+            significance_tier = "marginal"
+        else:
+            significance_tier = "not_significant"
+    else:
+        # Null sampling failed (e.g. too close to a frame edge to place off-source
+        # apertures) -- fall back to the naive snr but flag it as unverified so
+        # downstream code can treat it with appropriate caution rather than
+        # silently trusting a metric known to have a peak-selection bias.
+        significance_tier = "undetermined_fallback_naive"
+
+    info = parse_image_name(p.name)
+    object_id = info["object_id"] if info else ""
+    ra = float(info["ra"]) if info else np.nan
+    dec = float(info["dec"]) if info else np.nan
+    filt = info["filter"] if info else ""
+    filefracday = info["filefracday"] if info else ""
+    field = int(info["field"]) if info else -1
+    ccdid = int(info["ccdid"]) if info else -1
+    qid = int(info["qid"]) if info else -1
+    zero_point = _extract_zero_point(header)
+
+    # Detection now rests on the bias-corrected empirical significance alone.
+    # (Requiring the naive `snr` to also pass added no real protection -- it's
+    # biased in the same direction as a true source -- and only risked rejecting
+    # genuine faint transients in the 3-5 sigma band this pipeline cares about.)
+    if significance_tier == "undetermined_fallback_naive":
+        is_detection = bool(np.isfinite(snr) and snr >= float(marginal_snr_threshold))
+        effective_snr = snr
+    else:
+        is_detection = bool(snr_empirical >= float(marginal_snr_threshold))
+        effective_snr = snr_empirical
+
+    if is_detection and np.isfinite(zero_point) and np.isfinite(net_flux) and net_flux > 0:
+        mag = float(zero_point - 2.5 * np.log10(net_flux))
+        mag_err = float(1.0857362047581294 * flux_err / net_flux) if np.isfinite(flux_err) and flux_err > 0 else np.nan
+        upper_limit = np.nan
+        detection = True
+    elif np.isfinite(zero_point) and np.isfinite(flux_err) and flux_err > 0:
+        upper_flux = float(sigma) * flux_err
+        mag = np.nan
+        mag_err = np.nan
+        upper_limit = float(zero_point - 2.5 * np.log10(max(upper_flux, 1e-12)))
+        detection = False
+    else:
+        mag = np.nan
+        mag_err = np.nan
+        upper_limit = np.nan
+        detection = False
+
     return DifferenceImageSNR(
         image_path=str(p),
         source_x_px=float(source_x_px),
         source_y_px=float(source_y_px),
+        object_id=str(object_id),
+        ra=float(ra),
+        dec=float(dec),
+        filter=str(filt),
+        filefracday=str(filefracday),
+        field=int(field),
+        ccdid=int(ccdid),
+        qid=int(qid),
         fwhm_px=float(fwhm_px),
         fwhm_header_key=fwhm_key,
         aperture_radius_px=float(aperture_radius_px),
@@ -297,6 +556,17 @@ def process_difference_image(
         net_flux=float(net_flux),
         flux_err=float(flux_err),
         snr=float(snr),
+        null_flux_median=float(null_flux_median) if np.isfinite(null_flux_median) else np.nan,
+        null_flux_std=float(null_flux_std) if np.isfinite(null_flux_std) else np.nan,
+        n_null_apertures=int(n_null_apertures_used),
+        snr_empirical=float(snr_empirical) if np.isfinite(snr_empirical) else np.nan,
+        p_value_empirical=float(p_value_empirical) if np.isfinite(p_value_empirical) else np.nan,
+        significance_tier=str(significance_tier),
+        mag=float(mag) if np.isfinite(mag) else np.nan,
+        mag_err=float(mag_err) if np.isfinite(mag_err) else np.nan,
+        upper_limit=float(upper_limit) if np.isfinite(upper_limit) else np.nan,
+        detection=bool(detection),
+        zero_point=float(zero_point) if np.isfinite(zero_point) else np.nan,
         pixel_scale_arcsec_per_px=float(pixel_scale_arcsec(header)),
     )
 
