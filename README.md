@@ -32,8 +32,11 @@ The main pipeline follows these stages:
 │   ├── braai_batch.py                 # BRAAI model loading and inference
 │   ├── scripts/                       # Small pipeline utilities
 │   ├── tests/                         # Synthetic tests; no astronomy data needed
+│   ├── image_download.ipynb            # ZTF download workflow notebook
+│   ├── candidate_search.ipynb          # Candidate-search exploration
 │   └── ztf_downloads/                 # ZTF search, download, and SNR code
-├── galaxies/                          # Catalog-processing notebooks and utilities
+├── galaxies/
+│   └── galaxy_list.ipynb               # Galaxy-catalog workflow notebook
 ├── requirements.txt
 └── README.md
 ```

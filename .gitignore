@@ -9,7 +9,8 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .ipynb_checkpoints/
-*.ipynb
+/notebooks/
+/pipeline/image_download_original.ipynb
 
 # Local editor and operating-system files
 .vscode/
