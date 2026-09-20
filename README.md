@@ -33,7 +33,6 @@ The main pipeline follows these stages:
 │   ├── scripts/                       # Small pipeline utilities
 │   ├── tests/                         # Synthetic tests; no astronomy data needed
 │   └── ztf_downloads/                 # ZTF search, download, and SNR code
-├── notebooks/                         # Exploratory analysis notebooks
 ├── galaxies/                          # Catalog-processing notebooks and utilities
 ├── requirements.txt
 └── README.md
@@ -168,7 +167,7 @@ python pipeline/ztf_downloads/test_stage1_random_spots.py `
 4. Add only the source and documentation:
 
    ```powershell
-   git add .gitignore README.md requirements.txt pipeline notebooks galaxies
+   git add .gitignore README.md requirements.txt pipeline galaxies
    git status
    ```
 

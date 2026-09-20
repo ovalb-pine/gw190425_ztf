@@ -9,6 +9,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .ipynb_checkpoints/
+*.ipynb
 
 # Local editor and operating-system files
 .vscode/
