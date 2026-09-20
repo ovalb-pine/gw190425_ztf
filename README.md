@@ -33,7 +33,8 @@ the same peak-selection procedure as the source measurement.
 .
 ├── pipeline/
 │   ├── april_candidate_pipeline.py       # Main pipeline
-│   ├── config*.yaml                      # Example configurations
+│   ├── config.yaml                       # GW190425 configuration
+│   ├── config_validation_ztf22aabjpxh.yaml # ZTF22aabjpxh validation configuration
 │   ├── braai_batch.py                    # BRAAI inference helpers
 │   └── ztf_downloads/                    # ZTF search, download, and SNR code
 ├── galaxies/
@@ -76,9 +77,11 @@ python -m pip install -r requirements.txt
 
 ## Configuration
 
-Copy or adapt one of the YAML files in `pipeline/`. A configuration specifies
-the difference-image root, the galaxy
-catalog, the BRAAI model, thresholds, and the output directory. For example:
+Copy or adapt one of the YAML files in `pipeline/`. The default `config.yaml`
+targets GW190425; `config_validation_ztf22aabjpxh.yaml` contains the validation
+configuration for ZTF22aabjpxh. Each configuration specifies the difference-
+image root, science/reference-image roots, galaxy catalog, BRAAI model,
+thresholds, and output directory. For example:
 
 ```yaml
 diff_root: "../ztf_diff_cutout_imgs_catalog2"
@@ -94,10 +97,10 @@ Set-Location pipeline
 python april_candidate_pipeline.py --config config.yaml
 ```
 
-For the GW190425 setup:
+For the ZTF22aabjpxh validation setup:
 
 ```powershell
-python april_candidate_pipeline.py --config config_gw.yaml
+python april_candidate_pipeline.py --config config_validation_ztf22aabjpxh.yaml
 ```
 
 Use `--resume` to reuse existing stage outputs or `--force` to recompute them.
