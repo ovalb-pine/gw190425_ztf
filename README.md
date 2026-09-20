@@ -1,63 +1,52 @@
 # ZTF Candidate Pipeline
 
-Python tools for searching Zwicky Transient Facility (ZTF) image metadata,
-downloading science/reference/difference-image cutouts, measuring candidate SNR,
-building aligned image triplets, and ranking candidates with the BRAAI
-real/bogus classifier.
+An astronomy pipeline for processing Zwicky Transient Facility (ZTF) image
+cutouts, measuring candidate significance, building aligned image triplets, and
+ranking transient candidates with the BRAAI real/bogus classifier.
 
-This repository contains the analysis code and small synthetic tests. The ZTF
-cutouts, astronomy catalogs, trained model weights, and pipeline output folders
-are local or generated data and are intentionally excluded from Git.
+## Pipeline
 
-## What It Does
+The end-to-end workflow is organized into four stages:
 
-The main pipeline follows these stages:
+1. Index difference images and measure quadratic-centroid SNR.
+2. Build science, reference, and difference-image triplets.
+3. Score triplets with BRAAI and analyze pre-trigger/post-trigger photometry.
+4. Apply host-galaxy and image-quality filters and write candidate results.
 
-1. Index local ZTF difference images.
-2. Measure quadratic-centroid aperture SNR and empirical off-source significance.
-3. Build science/reference/difference triplets around a fixed sky position.
-4. Score triplets with BRAAI.
-5. Check pre-trigger and post-trigger photometry.
-6. Apply host-galaxy and image-quality filters.
-7. Save candidate tables and diagnostic plots.
+The SNR implementation also computes an empirical off-source significance using
+the same peak-selection procedure as the source measurement.
 
 ## Repository Layout
 
 ```text
 .
 ├── pipeline/
-│   ├── april_candidate_pipeline.py   # Main end-to-end pipeline
-│   ├── config.yaml                    # Example ZTF22aabjpxh configuration
-│   ├── config_gw.yaml                 # Example GW190425 configuration
-│   ├── braai_batch.py                 # BRAAI model loading and inference
-│   ├── scripts/                       # Small pipeline utilities
-│   ├── image_download.ipynb            # ZTF download workflow notebook
-│   └── ztf_downloads/                 # ZTF search, download, and SNR code
+│   ├── april_candidate_pipeline.py       # Main pipeline
+│   ├── april_candidate_pipeline_2.py     # Pipeline variant
+│   ├── config*.yaml                      # Example configurations
+│   ├── braai_batch.py                    # BRAAI inference helpers
+│   └── ztf_downloads/                    # ZTF search, download, and SNR code
 ├── galaxies/
-│   └── galaxy_list.ipynb               # Galaxy-catalog workflow notebook
+│   ├── galaxy_list.ipynb                 # Galaxy-catalog workflow
+│   └── util/                             # Catalog utilities
+├── pipeline/image_download.ipynb         # ZTF image-download workflow
 ├── requirements.txt
 └── README.md
 ```
 
 ## Requirements
 
-- Windows, Linux, or macOS
 - Python 3.10 or newer
-- A working C/C++ build environment may be needed by some scientific packages
-- Access to ZTF data if downloading new cutouts
-- The BRAAI package and a compatible model file for stage 2 inference
+- Dependencies listed in `requirements.txt`
+- ZTF image metadata and cutouts
+- Galaxy catalog data used by the selected configuration
+- BRAAI installed separately, with a compatible model file
 
-BRAAI is an upstream GitHub project and is not included in this repository.
-Install or clone it separately, and keep its model files outside this Git
-repository.
-
-The current `requirements.txt` records the working environment, including
-Jupyter and TensorFlow. For a smaller deployment environment, split it into
-runtime, test, and notebook requirements before publishing a release.
+The data products and BRAAI model weights are intentionally not stored in this
+repository. Keep them in local directories and point the configuration file to
+their locations.
 
 ## Installation
-
-From the repository root:
 
 ```powershell
 py -3.10 -m venv .venv
@@ -66,25 +55,20 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-On Linux or macOS, activate the environment with:
+On Linux or macOS:
 
 ```bash
+python3 -m venv .venv
 source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-## Input Data
+## Configuration
 
-Do not commit the following files to GitHub:
-
-- ZTF FITS/FITS.FZ cutouts
-- Large FITS catalogs and exported CSV catalogs
-- BRAAI `.h5` model files
-- Pipeline output directories, logs, progress files, and generated plots
-
-Keep them in a separate data directory or use GitHub Releases, Git LFS, Zenodo,
-or an institutional data store. Update the paths in a copied configuration file
-to point to those local files. The example configurations currently assume the
-data directories are adjacent to `pipeline/`:
+Copy or adapt one of the YAML files in `pipeline/`. A configuration specifies
+the difference-image, science-image, and reference-image roots, the galaxy
+catalog, the BRAAI model, thresholds, and the output directory. For example:
 
 ```yaml
 diff_root: "../ztf_diff_cutout_imgs_catalog2"
@@ -93,112 +77,32 @@ ref_root: "../ztf_ref_cutout_imgs"
 model_path: "../braai/models/braai_d6_m9.h5"
 ```
 
-The exact data products and access conditions should be documented in a future
-data README, including source survey, query dates, filters, and any catalog
-licenses or acknowledgements.
+The paths are resolved for execution from the `pipeline/` directory.
 
-## Run the Pipeline
-
-Run from the `pipeline` directory so the relative paths in the example configs
-resolve as intended:
+## Running
 
 ```powershell
 Set-Location pipeline
-python april_candidate_pipeline.py --config config.yaml --force
+python april_candidate_pipeline.py --config config.yaml
 ```
 
-For the GW190425 configuration:
+For the GW190425 setup:
 
 ```powershell
-python april_candidate_pipeline.py --config config_gw.yaml --force
+python april_candidate_pipeline.py --config config_gw.yaml
 ```
 
-Use `--resume` or the configuration's `resume: true` setting to reuse completed
-stage outputs. Generated tables and logs are written below the configured
-`out_root` directory.
+Use `--resume` to reuse existing stage outputs or `--force` to recompute them.
+Results are written below the configured `out_root` directory.
 
-## Run Tests
+## Data and Licensing
 
-From the repository root:
+Large FITS files, catalogs, trained model weights, generated outputs, local
+environments, and obsolete experimental files are excluded from Git. Users
+must obtain the relevant ZTF and catalog data from their original providers and
+follow those providers' attribution and redistribution terms.
 
-```powershell
-python -m pytest pipeline/tests
-```
+BRAAI is an external upstream project and is not included here. Its code and
+model are subject to their own repository's license and terms.
 
-The SNR test creates a synthetic FITS image in a temporary directory, so it does
-not require the local ZTF dataset.
-
-## Stage 1 Random-Spot Diagnostic
-
-The repository includes a diagnostic that compares stage 1 SNR at the source
-position with reproducible random noise positions and writes a ZScale PNG with
-numbered crosshairs to `pipeline/ztf_downloads/`:
-
-```powershell
-python pipeline/ztf_downloads/test_stage1_random_spots.py --n-spots 20
-```
-
-To use a specific image and save a CSV of measurements:
-
-```powershell
-python pipeline/ztf_downloads/test_stage1_random_spots.py `
-    path\to\difference_image.fits.fz `
-    --n-spots 30 `
-    --output pipeline\ztf_downloads\random_spot_snr.csv
-```
-
-## Publishing to GitHub
-
-1. Review the `.gitignore` and confirm that FITS files, model weights, outputs,
-   virtual environments, and bytecode are ignored.
-2. Inspect what would be committed:
-
-   ```powershell
-   git status --short
-   git check-ignore -v ztf_diff_cutout_imgs_catalog2\some_file.fits.fz
-   ```
-
-3. Remove accidental generated files from the index if any were previously
-   staged. Do not delete the local files:
-
-   ```powershell
-   git restore --staged -- .
-   ```
-
-4. Add only the source and documentation:
-
-   ```powershell
-   git add .gitignore README.md requirements.txt pipeline galaxies
-   git status
-   ```
-
-5. Commit and push to a new GitHub repository:
-
-   ```powershell
-   git commit -m "Prepare ZTF candidate pipeline for publication"
-   git remote add origin https://github.com/USERNAME/REPOSITORY.git
-   git push -u origin main
-   ```
-
-Replace `USERNAME/REPOSITORY` with the actual repository name. Never commit
-credentials, private catalog exports, or data whose redistribution is not
-permitted.
-
-## Before Making the Repository Public
-
-- Document the upstream BRAAI repository, version, and model download location.
-- Add a top-level license for the new pipeline code.
-- Add a citation file or publication reference if this work supports a paper.
-- Document the data source, data-release versions, and reproducibility paths.
-- Replace machine-specific paths and remove stale experimental scripts/configs.
-- Add continuous integration for `python -m pytest pipeline/tests`.
-- Consider splitting `requirements.txt` into `requirements-runtime.txt`,
-  `requirements-test.txt`, and `requirements-notebooks.txt`.
-- Use Git LFS or an external archive for large project-owned artifacts only after checking storage limits and
-  redistribution rights.
-
-## License
-
-The project license has not yet been selected. Add a top-level `LICENSE` file
-before publishing. BRAAI is an external upstream project and should retain its
-own license in its own repository.
+The license for the pipeline code has not yet been selected.
