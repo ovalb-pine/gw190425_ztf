@@ -21,7 +21,7 @@ The end-to-end workflow is organized into four stages:
 1. Index difference images and measure quadratic-centroid SNR.
 2. Build science, reference, and difference-image triplets.
 3. Score triplets with BRAAI and analyze pre-trigger/post-trigger photometry.
-4. Check FWHM consistency against catalog header values and write candidate results.
+4. Check FWHM consistency against ZTF image metadata and write candidate results.
 
 The SNR implementation also computes an empirical off-source significance using
 the same peak-selection procedure as the source measurement.
