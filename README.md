@@ -31,9 +31,7 @@ The main pipeline follows these stages:
 │   ├── config_gw.yaml                 # Example GW190425 configuration
 │   ├── braai_batch.py                 # BRAAI model loading and inference
 │   ├── scripts/                       # Small pipeline utilities
-│   ├── tests/                         # Synthetic tests; no astronomy data needed
 │   ├── image_download.ipynb            # ZTF download workflow notebook
-│   ├── candidate_search.ipynb          # Candidate-search exploration
 │   └── ztf_downloads/                 # ZTF search, download, and SNR code
 ├── galaxies/
 │   └── galaxy_list.ipynb               # Galaxy-catalog workflow notebook

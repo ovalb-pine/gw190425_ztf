@@ -11,6 +11,7 @@ __pycache__/
 .ipynb_checkpoints/
 /notebooks/
 /pipeline/image_download_original.ipynb
+/pipeline/candidate_search.ipynb
 
 # Local editor and operating-system files
 .vscode/
@@ -51,5 +52,4 @@ pipeline/ztf_downloads/*_out.csv
 
 # Generated catalog tables and local exports
 *.csv
-!pipeline/tests/**/*.csv
 !pipeline/config*.yaml
