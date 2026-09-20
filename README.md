@@ -4,6 +4,16 @@ An astronomy pipeline for processing Zwicky Transient Facility (ZTF) image
 cutouts, measuring candidate significance, building aligned image triplets, and
 ranking transient candidates with the BRAAI real/bogus classifier.
 
+## Project Status
+
+This project is part of an ongoing B.Sc. thesis at IKI RAS under the
+supervision of Alexei Pozanenko.
+
+The pipeline was applied to approximately 27,000 potential host galaxies in the
+GW190425 localization region. After SNR filtering, BRAAI classification,
+temporal vetting, and PSF consistency checks, 9 candidates remain for ongoing
+analysis. These results are preliminary and may change as the vetting continues.
+
 ## Pipeline
 
 The end-to-end workflow is organized into four stages:
@@ -11,10 +21,11 @@ The end-to-end workflow is organized into four stages:
 1. Index difference images and measure quadratic-centroid SNR.
 2. Build science, reference, and difference-image triplets.
 3. Score triplets with BRAAI and analyze pre-trigger/post-trigger photometry.
-4. Apply host-galaxy and image-quality filters and write candidate results.
+4. Check FWHM consistency against catalog header values and write candidate results.
 
 The SNR implementation also computes an empirical off-source significance using
 the same peak-selection procedure as the source measurement.
+
 
 ## Repository Layout
 
@@ -67,13 +78,11 @@ python -m pip install -r requirements.txt
 ## Configuration
 
 Copy or adapt one of the YAML files in `pipeline/`. A configuration specifies
-the difference-image, science-image, and reference-image roots, the galaxy
+the difference-image root, the galaxy
 catalog, the BRAAI model, thresholds, and the output directory. For example:
 
 ```yaml
 diff_root: "../ztf_diff_cutout_imgs_catalog2"
-sci_root: "../ztf_sci_cutout_imgs"
-ref_root: "../ztf_ref_cutout_imgs"
 model_path: "../braai/models/braai_d6_m9.h5"
 ```
 
@@ -95,6 +104,9 @@ python april_candidate_pipeline.py --config config_gw.yaml
 Use `--resume` to reuse existing stage outputs or `--force` to recompute them.
 Results are written below the configured `out_root` directory.
 
+## Example candidate
+<img width="3268" height="2544" alt="Example candidate diagnostic" src="https://github.com/user-attachments/assets/d311deeb-79a7-4dae-8e1c-2311e44a21d2" />
+
 ## Data and Licensing
 
 Large FITS files, catalogs, trained model weights, generated outputs, local
@@ -105,4 +117,11 @@ follow those providers' attribution and redistribution terms.
 BRAAI is an external upstream project and is not included here. Its code and
 model are subject to their own repository's license and terms.
 
-The license for the pipeline code has not yet been selected.
+This project is licensed under the MIT License. See the
+[LICENSE](LICENSE) file for details.
+
+## References
+
+- Duev et al. (2019), BRAAI: [arXiv:1907.11259](https://arxiv.org/abs/1907.11259)
+- Zwicky Transient Facility: [ztf.caltech.edu](https://ztf.caltech.edu/)
+
