@@ -33,7 +33,6 @@ the same peak-selection procedure as the source measurement.
 .
 ├── pipeline/
 │   ├── april_candidate_pipeline.py       # Main pipeline
-│   ├── april_candidate_pipeline_2.py     # Pipeline variant
 │   ├── config*.yaml                      # Example configurations
 │   ├── braai_batch.py                    # BRAAI inference helpers
 │   └── ztf_downloads/                    # ZTF search, download, and SNR code
