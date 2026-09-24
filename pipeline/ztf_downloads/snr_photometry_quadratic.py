@@ -372,6 +372,7 @@ def process_difference_image(
     min_valid_pixel: float = -5000.0,
     center_x: float | None = None,
     center_y: float | None = None,
+    recenter: bool = True,
     n_null_apertures: int = 100,
     n_null_apertures_refine: int = 400,
     refine_near_boundary: bool = True,
@@ -407,9 +408,12 @@ def process_difference_image(
         center_x = (data.shape[1] - 1) / 2.0
     if center_y is None or not np.isfinite(center_y):
         center_y = (data.shape[0] - 1) / 2.0
-    source_x_px, source_y_px = _conservative_centroid(
-        data, center_x, center_y, fwhm_px, max_shift_fwhm=3.0
-    )
+    if recenter:
+        source_x_px, source_y_px = _conservative_centroid(
+            data, center_x, center_y, fwhm_px, max_shift_fwhm=3.0
+        )
+    else:
+        source_x_px, source_y_px = float(center_x), float(center_y)
 
     aperture = CircularAperture([(source_x_px, source_y_px)], r=aperture_radius_px)
     ap_tbl = aperture_photometry(data, aperture)

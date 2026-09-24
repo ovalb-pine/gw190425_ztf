@@ -1455,6 +1455,7 @@ def stage3_pretrigger_magnitude(
                     min_valid_pixel=min_valid_pixel,
                     center_x=image_center[0] if image_center is not None else None,
                     center_y=image_center[1] if image_center is not None else None,
+                    recenter=False,
                 )
                 record_dict = record.__dict__.copy()
             except Exception as exc:
@@ -1483,6 +1484,7 @@ def stage3_pretrigger_magnitude(
                     min_valid_pixel=min_valid_pixel,
                     center_x=image_center[0] if image_center is not None else None,
                     center_y=image_center[1] if image_center is not None else None,
+                    recenter=False,
                 )
                 record_dict = record.__dict__.copy()
             except Exception as exc:
