@@ -1,8 +1,10 @@
 # Pipeline configuration
 trigger_date: "2022-02-19"
+trigger_label: "ZTF22aabjpxh trigger"
 lookback_days: 10
 posttrigger_days: 10
 snr_threshold: 3.0
+fwhm_reduced_chi2_max: 5.0
 braai_threshold: 0.25
 host_rmag_threshold: 25.5
 sigma: 3.0
@@ -18,8 +20,8 @@ sci_root: "../ztf_sci_cutout_imgs"
 ref_root: "../ztf_ref_cutout_imgs"
 ref_meta: "../metadata_ZTF22aabjpxh.csv"
 # final_class_csv: "ZTF22aabjpxh_galaxy_catalog.csv"
-final_class_csv: "final_class_table_new_(only_in_dist_bounds).csv"
-out_root: "ZTF22aabjpxh_candidate_pipeline_out"
+final_class_csv: "ZTF22aabjpxh_galaxy_catalog.csv"
+out_root: "ZTF22aabjpxh_candidate_pipeline_out05-10"
 model_path: "../braai/models/braai_d6_m9.h5"
 
 # Processing options

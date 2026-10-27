@@ -3,18 +3,20 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
 import re
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 try:
     import yaml
@@ -284,11 +286,15 @@ def collect_diff_index(diff_root: Path) -> pd.DataFrame:
     return pd.concat([ok_rows, other_rows], ignore_index=True)
 
 
-def measure_fwhm_from_image(diff_path: Path, center_x: float, center_y: float, box_size: int = 21) -> float:
+def measure_fwhm_from_image(
+    diff_path: Path, center_x: float, center_y: float, box_size: int = 21
+) -> tuple[float, float, float, float, float, float, float, float]:
     """
     Measure FWHM of the detection in the difference image at the given pixel position.
 
-    Returns FWHM in pixels, or np.nan if the fit fails.
+    Returns (FWHM, FWHM uncertainty, fit residual RMS, reduced chi-square,
+    PSF-vs-spike delta chi-square, PSF amplitude SNR, source-vs-background
+    delta chi-square, and PSF residual RMS in background-noise units.
     """
     try:
         from astropy.io import fits
@@ -296,12 +302,32 @@ def measure_fwhm_from_image(diff_path: Path, center_x: float, center_y: float, b
         import numpy as np
 
         with fits.open(diff_path, memmap=False) as hdul:
+            image_hdu = None
             for hdu in hdul:
                 if hdu.data is not None and hdu.data.ndim == 2:
-                    data = np.asarray(hdu.data, dtype=float)
+                    image_hdu = hdu
                     break
+            if image_hdu is None:
+                return (np.nan,) * 8
+            raw_data = image_hdu.data
+            if np.ma.isMaskedArray(raw_data):
+                data = np.asarray(raw_data.filled(np.nan), dtype=float)
+                valid_mask = ~np.ma.getmaskarray(raw_data)
             else:
-                return np.nan
+                data = np.asarray(raw_data, dtype=float)
+                valid_mask = np.ones(data.shape, dtype=bool)
+
+            # Respect a same-sized FITS mask/quality extension when present.
+            for hdu in hdul:
+                name = str(getattr(hdu, "name", "")).upper()
+                if (
+                    hdu is not image_hdu
+                    and hdu.data is not None
+                    and getattr(hdu.data, "shape", None) == data.shape
+                    and any(token in name for token in ("MASK", "QUALITY", "DQ"))
+                ):
+                    valid_mask &= np.asarray(hdu.data) == 0
+            data[~valid_mask] = np.nan
 
         # Crop region around the detection
         half = box_size // 2
@@ -312,39 +338,133 @@ def measure_fwhm_from_image(diff_path: Path, center_x: float, center_y: float, b
         x2 = min(data.shape[1], cx + half + 1)
         cutout = data[y1:y2, x1:x2]
 
-        if cutout.size == 0:
-            return np.nan
+        if cutout.size == 0 or np.count_nonzero(np.isfinite(cutout)) < 5:
+            return (np.nan,) * 8
 
-        # Fit a 2D Gaussian to the cutout
+        # Keep the Gaussian fixed on the stage-1 centroid; only fit its shape.
         yy, xx = np.indices(cutout.shape)
-        y_center, x_center = np.unravel_index(np.argmax(cutout), cutout.shape)
 
-        # Fit the source after subtracting a local background.  Keeping the
-        # Gaussian as a standalone model makes its fitted width available
-        # consistently across Astropy versions.
+        # Fit after subtracting a local background. Convert the exact subpixel
+        # centroid into cutout coordinates rather than recentering on a pixel peak.
         background = float(np.nanmedian(cutout))
         fit_data = cutout - background
-        peak_y, peak_x = np.unravel_index(np.nanargmax(fit_data), fit_data.shape)
+        fit_center_x = float(center_x) - x1
+        fit_center_y = float(center_y) - y1
 
+        finite_fit_data = fit_data[np.isfinite(fit_data)]
         gauss = models.Gaussian2D(
-            amplitude=float(np.nanmax(fit_data)),
-            x_mean=peak_x,
-            y_mean=peak_y,
+            amplitude=float(np.nanmax(finite_fit_data)),
+            x_mean=fit_center_x,
+            y_mean=fit_center_y,
             x_stddev=2.0,
             y_stddev=2.0,
         )
+        gauss.x_mean.fixed = True
+        gauss.y_mean.fixed = True
 
         fitter = fitting.LevMarLSQFitter()
-        fitted = fitter(gauss, xx, yy, fit_data)
+        fitted = fitter(gauss, xx, yy, fit_data, filter_non_finite=True)
+        model_data = fitted(xx, yy)
+        residuals = fit_data - model_data
+        finite_residuals = residuals[np.isfinite(residuals)]
+        fit_rms = (
+            float(np.sqrt(np.mean(np.square(finite_residuals))))
+            if finite_residuals.size
+            else np.nan
+        )
+        yy_center, xx_center = np.indices(cutout.shape)
+        background_mask = (
+            np.square(xx_center - fit_center_x) + np.square(yy_center - fit_center_y) > 25.0
+        )
+        background_values = fit_data[background_mask & np.isfinite(fit_data)]
+        if background_values.size >= 5:
+            noise = 1.4826 * np.median(
+                np.abs(background_values - np.median(background_values))
+            )
+            if not np.isfinite(noise) or noise <= 0:
+                noise = float(np.std(background_values, ddof=1))
+        else:
+            noise = np.nan
+        delta_chi2 = np.nan
+        psf_amplitude_snr = np.nan
+        source_delta_chi2 = np.nan
+        psf_residual_rms_sigma = np.nan
+        if np.isfinite(noise) and noise > 0 and finite_residuals.size:
+            finite_mask = np.isfinite(fit_data)
+            observed = fit_data[finite_mask]
+            psf_values = model_data[finite_mask]
+            psf_chi2 = float(np.sum(np.square((observed - psf_values) / noise)))
+            spike_mask = np.zeros(cutout.shape, dtype=float)
+            nearest_x = int(np.clip(round(fit_center_x), 0, cutout.shape[1] - 1))
+            nearest_y = int(np.clip(round(fit_center_y), 0, cutout.shape[0] - 1))
+            spike_mask[nearest_y, nearest_x] = 1.0
+            spike_values = spike_mask[finite_mask]
+            spike_amplitude = float(
+                np.sum(spike_values * observed) / np.sum(np.square(spike_values))
+            )
+            spike_model = spike_amplitude * spike_values
+            spike_chi2 = float(np.sum(np.square((observed - spike_model) / noise)))
+            delta_chi2 = spike_chi2 - psf_chi2
+            background_chi2 = float(np.sum(np.square(observed / noise)))
+            source_delta_chi2 = background_chi2 - psf_chi2
+            psf_residual_rms_sigma = float(
+                np.sqrt(np.mean(np.square((observed - psf_values) / noise)))
+            )
+        degrees_of_freedom = finite_residuals.size - 4
+        reduced_chi2 = (
+            float(np.sum(np.square(finite_residuals / noise)) / degrees_of_freedom)
+            if np.isfinite(noise) and noise > 0 and degrees_of_freedom > 0
+            else np.nan
+        )
 
         # FWHM = 2 * sqrt(2 * ln(2)) * sigma ≈ 2.35482 * sigma
         fwhm_x = 2.35482 * abs(float(fitted.x_stddev.value))
         fwhm_y = 2.35482 * abs(float(fitted.y_stddev.value))
         fwhm = np.mean([fwhm_x, fwhm_y])
 
-        return float(fwhm) if np.isfinite(fwhm) and fwhm > 0 else np.nan
+        covariance = fitter.fit_info.get("param_cov")
+        fwhm_error = np.nan
+        if covariance is not None and np.shape(covariance) == (4, 4):
+            # With the two centroid parameters fixed, free-parameter order is
+            # amplitude, x_stddev, y_stddev, theta.
+            sign_x = np.sign(float(fitted.x_stddev.value))
+            sign_y = np.sign(float(fitted.y_stddev.value))
+            width_variance = (2.35482 / 2.0) ** 2 * (
+                covariance[1, 1]
+                + covariance[2, 2]
+                + 2.0 * sign_x * sign_y * covariance[1, 2]
+            )
+            if np.isfinite(width_variance) and width_variance >= 0:
+                fwhm_error = float(np.sqrt(width_variance))
+            amplitude_variance = covariance[0, 0]
+            if np.isfinite(amplitude_variance) and amplitude_variance > 0:
+                psf_amplitude_snr = float(
+                    abs(float(fitted.amplitude.value)) / np.sqrt(amplitude_variance)
+                )
+
+        if np.isfinite(fwhm) and fwhm > 0:
+            return (
+                float(fwhm),
+                fwhm_error,
+                fit_rms,
+                reduced_chi2,
+                delta_chi2,
+                psf_amplitude_snr,
+                source_delta_chi2,
+                psf_residual_rms_sigma,
+            )
+        return (
+            np.nan,
+            np.nan,
+            fit_rms,
+            reduced_chi2,
+            delta_chi2,
+            psf_amplitude_snr,
+            source_delta_chi2,
+            psf_residual_rms_sigma,
+        )
     except Exception:
-        return np.nan
+        return (np.nan,) * 8
 
 from astropy.io import fits
 from astropy.wcs import WCS
@@ -353,10 +473,36 @@ import numpy as np
 
 def _load_image_and_wcs(path):
     with fits.open(path, memmap=False) as hdul:
+        image_hdu = None
         for hdu in hdul:
             if getattr(hdu, "data", None) is not None and hdu.data.ndim == 2:
-                return np.asarray(hdu.data, dtype=np.float32), WCS(hdu.header)
-    raise ValueError(f"No 2D image found in {path}")
+                image_hdu = hdu
+                break
+        if image_hdu is None:
+            raise ValueError(f"No 2D image found in {path}")
+
+        raw_data = image_hdu.data
+        if np.ma.isMaskedArray(raw_data):
+            data = np.asarray(raw_data.filled(np.nan), dtype=np.float32)
+            valid_mask = ~np.ma.getmaskarray(raw_data)
+        else:
+            data = np.asarray(raw_data, dtype=np.float32)
+            valid_mask = np.ones(data.shape, dtype=bool)
+
+        # Keep FITS mask/quality information so it survives triplet creation.
+        for hdu in hdul:
+            name = str(getattr(hdu, "name", "")).upper()
+            if (
+                hdu is not image_hdu
+                and hdu.data is not None
+                and getattr(hdu.data, "shape", None) == data.shape
+                and any(token in name for token in ("MASK", "QUALITY", "DQ"))
+            ):
+                valid_mask &= np.asarray(hdu.data) == 0
+
+        valid_mask &= np.isfinite(data)
+        data[~valid_mask] = np.nan
+        return data, WCS(image_hdu.header), valid_mask
 
 
 def _sky_coordinates_from_pixel(path: Path, x_px: float, y_px: float) -> tuple[float, float] | None:
@@ -364,7 +510,7 @@ def _sky_coordinates_from_pixel(path: Path, x_px: float, y_px: float) -> tuple[f
     if not np.isfinite(x_px) or not np.isfinite(y_px):
         return None
     try:
-        _, wcs = _load_image_and_wcs(path)
+        _, wcs, _ = _load_image_and_wcs(path)
         image_wcs = wcs.celestial if getattr(wcs, "naxis", 2) > 2 else wcs
         ra, dec = image_wcs.all_pix2world(float(x_px), float(y_px), 0)
         ra = float(np.asarray(ra).reshape(-1)[0])
@@ -381,7 +527,7 @@ def _pixel_coordinates_from_sky(path: Path, ra: float, dec: float) -> tuple[floa
     if not np.isfinite(ra) or not np.isfinite(dec):
         return None
     try:
-        _, wcs = _load_image_and_wcs(path)
+        _, wcs, _ = _load_image_and_wcs(path)
         image_wcs = wcs.celestial if getattr(wcs, "naxis", 2) > 2 else wcs
         x_px, y_px = image_wcs.all_world2pix(float(ra), float(dec), 0)
         x_px = float(np.asarray(x_px).reshape(-1)[0])
@@ -419,6 +565,23 @@ def _crop(data, cx, cy, size):
     return out
 
 
+def _crop_mask(valid_mask, cx, cy, size):
+    """Crop a validity mask, marking pixels outside the source image invalid."""
+    half = size // 2
+    cx = int(round(cx))
+    cy = int(round(cy))
+    out = np.zeros((size, size), dtype=bool)
+    x1 = max(0, cx - half)
+    x2 = min(valid_mask.shape[1], cx + half + 1)
+    y1 = max(0, cy - half)
+    y2 = min(valid_mask.shape[0], cy + half + 1)
+    crop = valid_mask[y1:y2, x1:x2]
+    ox = half - (cx - x1)
+    oy = half - (cy - y1)
+    out[oy:oy + crop.shape[0], ox:ox + crop.shape[1]] = crop
+    return out
+
+
 def build_triplet(
     diff_path,
     sci_path,
@@ -434,7 +597,7 @@ def build_triplet(
         raise ValueError("Finite RA and Dec are required to build a WCS-aligned triplet")
 
     def load_and_crop(path):
-        data, wcs = _load_image_and_wcs(path)
+        data, wcs, valid_mask = _load_image_and_wcs(path)
         # ZTF headers can contain non-celestial axes.  Project through the
         # celestial WCS so the result is always a 2D pixel position.
         image_wcs = wcs.celestial if getattr(wcs, "naxis", 2) > 2 else wcs
@@ -455,18 +618,25 @@ def build_triplet(
         y_px = float(np.asarray(y_px).reshape(-1)[0])
         if not np.isfinite(x_px) or not np.isfinite(y_px):
             raise ValueError(f"Could not project source coordinates into {path}")
-        return _crop(data, x_px, y_px, size), (float(x_px), float(y_px))
+        return (
+            _crop(data, x_px, y_px, size),
+            _crop_mask(valid_mask, x_px, y_px, size),
+            (float(x_px), float(y_px)),
+        )
 
-    diff, diff_position = load_and_crop(diff_path)
-    sci, sci_position = load_and_crop(sci_path)
-    ref, ref_position = load_and_crop(ref_path)
+    diff, diff_mask, diff_position = load_and_crop(diff_path)
+    sci, sci_mask, sci_position = load_and_crop(sci_path)
+    ref, ref_mask, ref_position = load_and_crop(ref_path)
 
     source_positions = {
         "sci": sci_position,
         "ref": ref_position,
         "diff": diff_position,
     }
-    return np.stack([sci, ref, diff], axis=-1), source_positions
+    triplet = np.stack([sci, ref, diff], axis=-1)
+    valid_masks = np.stack([sci_mask, ref_mask, diff_mask], axis=-1)
+    triplet[~valid_masks] = np.nan
+    return triplet, source_positions, valid_masks
 
 
 def stage0_diff_index(diff_root: Path, out_root: Path, limit_images: int = 0, object_ids: Iterable[str] | None = None, *, resume: bool = True) -> pd.DataFrame:
@@ -486,6 +656,46 @@ def stage0_diff_index(diff_root: Path, out_root: Path, limit_images: int = 0, ob
     return df
 
 
+def _measure_stage1_image_task(task: tuple) -> dict:
+    """Process one FITS image in a worker process for stage1 SNR measurement."""
+    image_path, sky_position, sigma, maxiters, min_valid_pixel, null_seed = task
+    image_path = Path(image_path)
+    if sky_position is None:
+        parsed = parse_diff_name(image_path.name) or {}
+        fallback_ra = _safe_float(parsed.get("ra"))
+        fallback_dec = _safe_float(parsed.get("dec"))
+        sky_position = (
+            (fallback_ra, fallback_dec)
+            if np.isfinite(fallback_ra) and np.isfinite(fallback_dec)
+            else None
+        )
+
+    center = _pixel_coordinates_from_sky(image_path, *sky_position) if sky_position is not None else None
+    try:
+        record = process_difference_image(
+            image_path,
+            sigma=sigma,
+            maxiters=maxiters,
+            min_valid_pixel=min_valid_pixel,
+            center_x=center[0] if center is not None else None,
+            center_y=center[1] if center is not None else None,
+            null_seed=null_seed,
+        )
+        record_dict = record.__dict__.copy()
+        centroid_sky = _sky_coordinates_from_pixel(
+            image_path,
+            record_dict.get("source_x_px", np.nan),
+            record_dict.get("source_y_px", np.nan),
+        )
+        if centroid_sky is not None:
+            record_dict["centroid_ra"] = centroid_sky[0]
+            record_dict["centroid_dec"] = centroid_sky[1]
+        record_dict["status"] = "ok"
+        return record_dict
+    except Exception as exc:
+        return {"image_path": str(image_path), "status": f"error: {exc}"}
+
+
 def stage1_quadratic_snr(
     diff_index: pd.DataFrame,
     out_root: Path,
@@ -495,6 +705,7 @@ def stage1_quadratic_snr(
     sigma: float,
     maxiters: int,
     min_valid_pixel: float,
+    max_workers: int = 1,
     resume: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     stage1_dir = ensure_dir(out_root / "stage1")
@@ -518,40 +729,43 @@ def stage1_quadratic_snr(
         return empty, empty
 
     coord_index = _build_object_coordinate_index(final_class_df)
-    rows = []
+    tasks = []
     for _, image_row in diff_index.iterrows():
         image_path = Path(str(image_row["image_path"]))
         object_id = _extract_object_id(image_row.get("object_id", ""))
         sky_position = coord_index.get(object_id)
-        if sky_position is None:
-            parsed = parse_diff_name(image_path.name) or {}
-            fallback_ra = _safe_float(parsed.get("ra"))
-            fallback_dec = _safe_float(parsed.get("dec"))
-            sky_position = (fallback_ra, fallback_dec) if np.isfinite(fallback_ra) and np.isfinite(fallback_dec) else None
+        tasks.append(
+            (
+                str(image_path),
+                sky_position,
+                sigma,
+                maxiters,
+                min_valid_pixel,
+                abs(hash(str(image_path))) % (2**32),
+            )
+        )
 
-        center = _pixel_coordinates_from_sky(image_path, *sky_position) if sky_position is not None else None
-        try:
-            record = process_difference_image(
-                image_path,
-                sigma=sigma,
-                maxiters=maxiters,
-                min_valid_pixel=min_valid_pixel,
-                center_x=center[0] if center is not None else None,
-                center_y=center[1] if center is not None else None,
+    worker_count = max(1, int(max_workers))
+    if worker_count == 1:
+        rows = list(
+            tqdm(
+                map(_measure_stage1_image_task, tasks),
+                total=len(tasks),
+                desc="Measuring empirical SNR",
+                unit="image",
             )
-            record_dict = record.__dict__.copy()
-            centroid_sky = _sky_coordinates_from_pixel(
-                image_path,
-                record_dict.get("source_x_px", np.nan),
-                record_dict.get("source_y_px", np.nan),
+        )
+    else:
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            rows = list(
+                tqdm(
+                    executor.map(_measure_stage1_image_task, tasks, chunksize=16),
+                    total=len(tasks),
+                    desc="Measuring empirical SNR",
+                    unit="image",
+                )
             )
-            if centroid_sky is not None:
-                record_dict["centroid_ra"] = centroid_sky[0]
-                record_dict["centroid_dec"] = centroid_sky[1]
-            record_dict["status"] = "ok"
-        except Exception as exc:
-            record_dict = {"image_path": str(image_path), "status": f"error: {exc}"}
-        rows.append(record_dict)
+
     rows = pd.DataFrame(rows)
     if "image_path" not in rows.columns:
         rows["image_path"] = diff_index["image_path"].values[: len(rows)]
@@ -683,6 +897,18 @@ def stage2_triplets(
             cached_manifest = None
         if cached_complete is not None and not {"centroid_ra", "centroid_dec"}.issubset(cached_complete.columns):
             cached_complete = None
+        # Triplets created before mask persistence cannot be trusted for
+        # morphology plots. Rebuild them rather than silently reusing them.
+        if cached_complete is not None and any(
+            not Path(str(row.get("triplet_path", ""))).with_name("triplet_valid_mask.npy").exists()
+            for _, row in cached_complete.iterrows()
+            if str(row.get("triplet_path", ""))
+        ):
+            cached_manifest = None
+            cached_complete = None
+            manifest_rows.clear()
+            complete_rows.clear()
+
         if cached_manifest is not None:
             manifest_rows.extend(cached_manifest.to_dict("records"))
         if cached_complete is not None:
@@ -702,6 +928,9 @@ def stage2_triplets(
             still_valid = ready_rows[
                 ready_rows["image_path"].astype(str).astype(bool)
                 & ready_rows["triplet_path"].apply(lambda p: Path(str(p)).exists())
+                & ready_rows["triplet_path"].apply(
+                    lambda p: Path(str(p)).with_name("triplet_valid_mask.npy").exists()
+                )
             ]
             completed_ids = set(still_valid["image_path"].astype(str))
             # objects.csv was missing/empty even though these triplets already
@@ -805,7 +1034,7 @@ def stage2_triplets(
         source_positions = None
         if sci_dst.exists() and ref_dst.exists() and diff_dst.exists():
             try:
-                triplet, source_positions = build_triplet(
+                triplet, source_positions, valid_masks = build_triplet(
                     diff_dst,
                     sci_dst,
                     ref_dst,
@@ -829,6 +1058,7 @@ def stage2_triplets(
             manifest["triplet_ready"] = True
             manifest["triplet_path"] = str(group_dir / "triplet.npy")
             np.save(group_dir / "triplet.npy", triplet)
+            np.save(group_dir / "triplet_valid_mask.npy", valid_masks)
             complete = manifest.copy()
             complete["diff_path"] = str(diff_dst)
             complete["sci_path"] = str(sci_dst)
@@ -1176,6 +1406,7 @@ def stage3_pretrigger_magnitude(
             if (
                 {"stage1_centroid_ra", "stage1_centroid_dec"}.issubset(cached_objects.columns)
                 and "snr_empirical" in cached_images.columns
+                and "stage3_coordinate_source" in cached_images.columns
                 and "pretrigger_mag_pass" in cached_objects.columns
                 and cached_objects["pretrigger_mag_pass"].any()
                 and cache_has_all_filters
@@ -1211,6 +1442,40 @@ def stage3_pretrigger_magnitude(
     coord_lookup = {}
     # also collect source pixel centers from stage2_objects so we can carry them forward
     source_center_lookup = {}
+    stage1_images_path = out_dir.parent / "stage1" / "april_stage1_quadratic_snr_images.csv"
+    stage1_images = load_csv_if_exists(stage1_images_path)
+    stage1_by_image: dict[str, dict] = {}
+    best_stage1_sky: dict[str, tuple[float, float]] = {}
+    best_stage1_image: dict[str, str] = {}
+    if stage1_images is not None and "image_path" in stage1_images.columns:
+        stage1_images = stage1_images.copy()
+        stage1_images["_object_key"] = stage1_images["object_id"].map(normalize_object_id)
+        stage1_images["_snr_rank"] = pd.to_numeric(
+            stage1_images.get("snr_empirical"), errors="coerce"
+        ).fillna(-np.inf)
+        for _, stage1_row in stage1_images.sort_values("_snr_rank", ascending=False).drop_duplicates(
+            "_object_key"
+        ).iterrows():
+            obj = str(stage1_row.get("_object_key", ""))
+            best_stage1_image[obj] = str(Path(str(stage1_row["image_path"])).resolve())
+            ra = _safe_float(stage1_row.get("centroid_ra"))
+            dec = _safe_float(stage1_row.get("centroid_dec"))
+            if np.isfinite(ra) and np.isfinite(dec):
+                best_stage1_sky[obj] = (ra, dec)
+            else:
+                path = Path(str(stage1_row["image_path"]))
+                sx = _safe_float(stage1_row.get("source_x_px"))
+                sy = _safe_float(stage1_row.get("source_y_px"))
+                projected = _sky_coordinates_from_pixel(path, sx, sy)
+                if projected is not None:
+                    best_stage1_sky[obj] = projected
+    if stage1_images is not None and {"image_path", "source_x_px", "source_y_px"}.issubset(stage1_images.columns):
+        for _, stage1_row in stage1_images.iterrows():
+            sx = _safe_float(stage1_row.get("source_x_px"))
+            sy = _safe_float(stage1_row.get("source_y_px"))
+            if np.isfinite(sx) and np.isfinite(sy):
+                image_key = str(Path(str(stage1_row["image_path"])).resolve())
+                stage1_by_image[image_key] = stage1_row.to_dict()
     # sci_path is produced back in stage2 (per-image) but was previously dropped before
     # stage4. stage4 needs the diff image (not sci) to measure fwhm_px, since
     # measure_fwhm_from_image operates on the difference image at the detection position.
@@ -1231,19 +1496,22 @@ def stage3_pretrigger_magnitude(
             if obj not in diff_path_lookup or (np.isfinite(row_score) and row_score > best_score):
                 diff_path_lookup[obj] = row_diff_path
                 best_braai_seen[obj] = row_score if np.isfinite(row_score) else best_score
-        # Reuse the stage-1 centroid sky position when available.
-        ra = _safe_float(row.get("centroid_ra", row.get("ra_used", row.get("ra", np.nan))))
-        dec = _safe_float(row.get("centroid_dec", row.get("dec_used", row.get("dec", np.nan))))
-        if np.isfinite(ra) and np.isfinite(dec):
-            coord_lookup[obj] = (ra, dec)
+        # Use exactly one sky anchor per object: the best stage-1 centroid.
+        if obj in best_stage1_sky:
+            coord_lookup[obj] = best_stage1_sky[obj]
         else:
-            # If missing, try from work (last resort)
-            obj_rows = work[work["object_id"] == obj]
-            if not obj_rows.empty:
-                ra = np.nanmedian(obj_rows["ra"])
-                dec = np.nanmedian(obj_rows["dec"])
-                if np.isfinite(ra) and np.isfinite(dec):
-                    coord_lookup[obj] = (ra, dec)
+            ra = _safe_float(row.get("centroid_ra", row.get("ra_used", row.get("ra", np.nan))))
+            dec = _safe_float(row.get("centroid_dec", row.get("dec_used", row.get("dec", np.nan))))
+            if np.isfinite(ra) and np.isfinite(dec):
+                coord_lookup[obj] = (ra, dec)
+            else:
+                # If missing, try from work (last resort)
+                obj_rows = work[work["object_id"] == obj]
+                if not obj_rows.empty:
+                    ra = np.nanmedian(obj_rows["ra"])
+                    dec = np.nanmedian(obj_rows["dec"])
+                    if np.isfinite(ra) and np.isfinite(dec):
+                        coord_lookup[obj] = (ra, dec)
         # source pixel centers: try common column names
         sx = _safe_float(row.get("source_x_px", row.get("source_x", row.get("x", np.nan))))
         sy = _safe_float(row.get("source_y_px", row.get("source_y", row.get("y", np.nan))))
@@ -1257,6 +1525,41 @@ def stage3_pretrigger_magnitude(
     object_ids = list(dict.fromkeys(object_ids))
     if not object_ids:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    def _measurement_center(path: Path, object_id: str):
+        """Project the single best stage-1 sky anchor into this image."""
+        sky = coord_lookup.get(object_id)
+        if sky is not None:
+            projected = _pixel_coordinates_from_sky(path, sky[0], sky[1])
+            if projected is not None:
+                return projected, "stage1_centroid_wcs"
+        return None, "missing_stage1_centroid"
+
+    def _reuse_stage1_significance(path: Path, object_id: str, record_dict: dict) -> dict:
+        """Keep the stage-1 result only for the image defining the common anchor."""
+        if best_stage1_image.get(object_id) != str(path.resolve()):
+            return record_dict
+        stage1_row = stage1_by_image.get(str(path.resolve()))
+        if stage1_row is None:
+            return record_dict
+        for field in (
+            "snr",
+            "snr_empirical",
+            "p_value_empirical",
+            "significance_tier",
+            "detection",
+            "mag",
+            "mag_err",
+            "upper_limit",
+        ):
+            if field in stage1_row and pd.notna(stage1_row[field]):
+                value = stage1_row[field]
+                if field in {"snr", "snr_empirical", "p_value_empirical"}:
+                    value = _safe_float(value)
+                elif field == "detection":
+                    value = str(value).strip().lower() in {"true", "1", "yes"}
+                record_dict[field] = value
+        return record_dict
 
     # Load final-class CSV to map object ids -> row numbers for naming
     try:
@@ -1441,13 +1744,13 @@ def stage3_pretrigger_magnitude(
         # Measure post-trigger magnitudes
         post_mags = []
         post_mag_errs = []
+        post_records = []
         for _, row in object_post.iterrows():
             path = Path(row["image_path"])
             if not path.exists():
                 continue
             try:
-                object_ra, object_dec = coord_lookup.get(object_id, (np.nan, np.nan))
-                image_center = _pixel_coordinates_from_sky(path, object_ra, object_dec)
+                image_center, coordinate_source = _measurement_center(path, object_id)
                 record = process_difference_image(
                     path,
                     sigma=sigma,
@@ -1458,11 +1761,14 @@ def stage3_pretrigger_magnitude(
                     recenter=False,
                 )
                 record_dict = record.__dict__.copy()
+                record_dict = _reuse_stage1_significance(path, object_id, record_dict)
+                record_dict["stage3_coordinate_source"] = coordinate_source
             except Exception as exc:
                 image_rows.append({"object_id": object_id, "image_path": str(path), "status": f"error: {exc}"})
                 continue
             record_dict.update({"object_id": object_id, "phase": "posttrigger"})
             image_rows.append(record_dict)
+            post_records.append(record_dict)
             if np.isfinite(record_dict.get("mag", np.nan)):
                 post_mags.append(float(record_dict["mag"]))
                 if np.isfinite(record_dict.get("mag_err", np.nan)):
@@ -1475,8 +1781,7 @@ def stage3_pretrigger_magnitude(
             if not path.exists():
                 continue
             try:
-                object_ra, object_dec = coord_lookup.get(object_id, (np.nan, np.nan))
-                image_center = _pixel_coordinates_from_sky(path, object_ra, object_dec)
+                image_center, coordinate_source = _measurement_center(path, object_id)
                 record = process_difference_image(
                     path,
                     sigma=sigma,
@@ -1487,6 +1792,8 @@ def stage3_pretrigger_magnitude(
                     recenter=False,
                 )
                 record_dict = record.__dict__.copy()
+                record_dict = _reuse_stage1_significance(path, object_id, record_dict)
+                record_dict["stage3_coordinate_source"] = coordinate_source
             except Exception as exc:
                 image_rows.append({"object_id": object_id, "image_path": str(path), "status": f"error: {exc}"})
                 continue
@@ -1556,9 +1863,6 @@ def stage3_pretrigger_magnitude(
         object_rows.append({
             "object_id": object_id,
             "n_pretrigger_images": n_pre,
-            "pretrigger_mag_ref": pre_ref if pre_mags else np.nan,
-            "pretrigger_mag_ref_err": pre_ref_err,
-            "pretrigger_mag_max_residual": pre_max_residual,
             "pretrigger_mag_upper_limit": float(np.nanmax(pre_upper_limits)) if pre_upper_limits else np.nan,
             "pretrigger_mag_consistent": consistent,
             "pretrigger_mag_pass": pass_flag,
@@ -1584,14 +1888,108 @@ def stage3_pretrigger_magnitude(
     write_csv(stage3_objects_pass, objects_path)
     return mag_df, stage3_objects_all, stage3_objects_pass
 
-def stage4_host_mag(stage3_objects: pd.DataFrame, final_class_df: pd.DataFrame, out_root: Path, *, host_rmag_threshold: float, resume: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _compute_spike_ratio_from_image(
+    diff_path: str | Path | None,
+    center_x: float | None,
+    center_y: float | None,
+    seeing_fwhm: float | None,
+) -> float:
+    """Compute the peak-to-PSF-amplitude ratio for a compact source.
+
+    This is not a universal visibility gate on its own; it is used as a diagnostic
+    that can be combined with the PSF-wing score below when a stricter veto is desired.
+    """
+    if diff_path is None or not Path(str(diff_path)).exists():
+        return np.nan
+    if center_x is None or center_y is None or not np.isfinite(center_x) or not np.isfinite(center_y):
+        return np.nan
+    if seeing_fwhm is None or not np.isfinite(seeing_fwhm) or seeing_fwhm <= 0:
+        return np.nan
+    try:
+        from astropy.io import fits
+        import numpy as np
+
+        data = fits.getdata(str(diff_path), memmap=False)
+        arr = np.asarray(data, dtype=float)
+        yy, xx = np.indices(arr.shape)
+        r2 = (xx - center_x) ** 2 + (yy - center_y) ** 2
+        s = seeing_fwhm / 2.35482
+        psf = np.exp(-r2 / (2.0 * s * s))
+        ok = np.isfinite(arr) & np.isfinite(psf)
+        if not np.any(ok):
+            return np.nan
+        w = psf[ok]
+        d = arr[ok]
+        denom = float((w * w).sum())
+        if denom == 0:
+            return np.nan
+        amp = float((w * d).sum() / denom)
+        if not np.isfinite(amp) or amp == 0:
+            return np.nan
+        peak = np.nanmax(np.where(r2 <= 4.0, arr, np.nan))
+        if not np.isfinite(peak):
+            return np.nan
+        return float(peak / amp)
+    except Exception:
+        return np.nan
+
+
+def _compute_psf_visibility_score(
+    psf_spike_delta_chi2: pd.Series,
+    spike_ratio: pd.Series,
+    fwhm_ratio: pd.Series,
+) -> pd.Series:
+    """Return a composite score favouring clean PSF-like sources over spikes.
+
+    This is calibrated on the current 14-object sample and should be treated as a
+    ranking score or an optional veto, not as a universal science gate.
+    """
+    delta = pd.to_numeric(psf_spike_delta_chi2, errors="coerce").fillna(0.0)
+    spike = pd.to_numeric(spike_ratio, errors="coerce").fillna(0.0)
+    ratio = pd.to_numeric(fwhm_ratio, errors="coerce").fillna(1.0)
+    feature_df = pd.DataFrame(
+        {
+            "log1p_delta": np.log1p(np.clip(delta.to_numpy(dtype=float), 0.0, None)),
+            "log1p_spike": np.log1p(np.clip(spike.to_numpy(dtype=float), 0.0, None)),
+            "fwhm_ratio": ratio.to_numpy(dtype=float),
+        }
+    )
+    mu = feature_df.mean(axis=0)
+    sigma = feature_df.std(axis=0, ddof=0).replace(0, 1.0)
+    standardized = (feature_df - mu) / sigma
+    weights = np.array([4.72105977, 0.4658493, -4.07055548], dtype=float)
+    return standardized.dot(weights)
+
+
+def stage4_host_mag(
+    stage3_objects: pd.DataFrame,
+    final_class_df: pd.DataFrame,
+    out_root: Path,
+    *,
+    host_rmag_threshold: float,
+    fwhm_reduced_chi2_max: float = 5.0,
+    fwhm_ratio_min: float = 0.5,
+    fwhm_ratio_max: float = 1.8,
+    fwhm_sigma_multiplier: float = 3.0,
+    psf_spike_delta_chi2_min: float = 9.0,
+    psf_amplitude_snr_min: float = 3.0,
+    source_delta_chi2_min: float = 9.0,
+    psf_residual_rms_sigma_max: float = 1.5,
+    candidate_snr_min: float = 3.0,
+    candidate_snr_max: float = 5.0,
+    psf_visibility_gate_enabled: bool = False,
+    psf_visibility_score_min: float = 2.362838023766029,
+    resume: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     final_class_df = _ensure_object_id_column(final_class_df)
 
     stage4_dir = ensure_dir(out_root / "stage4")
     host_objects_path = stage4_dir / "april_stage4_hostmag_objects.csv"
     final_candidates_path = stage4_dir / "april_stage4_final_candidates.csv"
+    uncertain_candidates_path = stage4_dir / "april_stage4_fwhm_uncertain_candidates.csv"
     cached_host = load_csv_if_exists(host_objects_path)
     cached_final = load_csv_if_exists(final_candidates_path)
+    cached_uncertain = load_csv_if_exists(uncertain_candidates_path)
     if cached_host is not None and cached_final is not None and not cached_host.empty:
         if resume:
             cached_ids = cached_host["object_id"].astype(str).map(normalize_object_id).tolist()
@@ -1600,18 +1998,64 @@ def stage4_host_mag(stage3_objects: pd.DataFrame, final_class_df: pd.DataFrame, 
             diff_fwhm_cache_valid = "diff_fwhm" in cached_host.columns and cached_diff_fwhm.notna().all()
             cached_fwhm = pd.to_numeric(cached_host.get("fwhm_px"), errors="coerce")
             fwhm_cache_valid = "fwhm_px" in cached_host.columns and cached_fwhm.notna().all()
+            fwhm_error_cache_valid = "fwhm_err_px" in cached_host.columns
+            fwhm_fit_rms_cache_valid = "fwhm_fit_rms" in cached_host.columns
+            fwhm_chi2_cache_valid = "fwhm_reduced_chi2" in cached_host.columns
+            fwhm_filter_cache_valid = (
+                "fwhm_filter_version" in cached_host.columns
+                and pd.to_numeric(cached_host["fwhm_filter_version"], errors="coerce").eq(10).all()
+                and {
+                    "fwhm_ratio",
+                    "fwhm_ratio_min",
+                    "fwhm_ratio_max",
+                    "fwhm_sigma_multiplier",
+                    "psf_spike_delta_chi2",
+                    "psf_amplitude_snr",
+                    "psf_spike_delta_chi2_min",
+                    "psf_amplitude_snr_min",
+                    "source_delta_chi2",
+                    "psf_residual_rms_sigma",
+                    "source_delta_chi2_min",
+                    "psf_residual_rms_sigma_max",
+                    "candidate_snr_min",
+                    "candidate_snr_max",
+                }.issubset(cached_host.columns)
+                and pd.to_numeric(cached_host["fwhm_ratio_min"], errors="coerce").eq(float(fwhm_ratio_min)).all()
+                and pd.to_numeric(cached_host["fwhm_ratio_max"], errors="coerce").eq(float(fwhm_ratio_max)).all()
+                and pd.to_numeric(cached_host["fwhm_sigma_multiplier"], errors="coerce").eq(float(fwhm_sigma_multiplier)).all()
+                and pd.to_numeric(cached_host["psf_spike_delta_chi2_min"], errors="coerce").eq(float(psf_spike_delta_chi2_min)).all()
+                and pd.to_numeric(cached_host["psf_amplitude_snr_min"], errors="coerce").eq(float(psf_amplitude_snr_min)).all()
+                and pd.to_numeric(cached_host["source_delta_chi2_min"], errors="coerce").eq(float(source_delta_chi2_min)).all()
+                and pd.to_numeric(cached_host["psf_residual_rms_sigma_max"], errors="coerce").eq(float(psf_residual_rms_sigma_max)).all()
+                and pd.to_numeric(cached_host["candidate_snr_min"], errors="coerce").eq(float(candidate_snr_min)).all()
+                and pd.to_numeric(cached_host["candidate_snr_max"], errors="coerce").eq(float(candidate_snr_max)).all()
+            )
             magnitude_cache_valid = {"best_snr_mag", "best_snr_mag_err"}.issubset(cached_host.columns)
+            snr_cache_valid = {
+                "snr",
+                "snr_empirical",
+                "best_snr_normal",
+                "best_snr_empirical",
+                "snr_all",
+                "snr_empirical_all",
+            }.issubset(cached_host.columns)
+            removed_columns_absent = not {
+                "pretrigger_mag_ref",
+                "pretrigger_mag_ref_err",
+                "pretrigger_mag_max_residual",
+            }.intersection(cached_host.columns)
             host_mag_metadata_cache_valid = {"host_rmag", "host_rmag_source", "host_rmag_band", "host_rmag_catalog", "host_w1_mag", "host_w2_mag", "host_w1_catalog", "host_w2_catalog", "host_desi_id"}.issubset(cached_host.columns)
             legacy_dr9_cache_valid = (
                 {"legacy_dr9_status", "legacy_dr9_sep_arcsec", "legacy_gmag", "legacy_rmag", "legacy_zmag", "legacy_dr9_type", "legacy_dr9_objid"}.issubset(cached_host.columns)
                 and not cached_host["legacy_dr9_status"].astype(str).eq("request_error").any()
             )
             fwhm_consistency_cache_valid = {"fwhm_px", "diff_fwhm", "fwhm_pass", "fwhm_reason"}.issubset(cached_host.columns)
+            fwhm_status_cache_valid = "fwhm_status" in cached_host.columns
             fwhm_source_cache_valid = (
                 "fwhm_source" in cached_host.columns
-                and cached_host["fwhm_source"].astype(str).eq("stage1_best_snr_centroid").all()
+                and cached_host["fwhm_source"].astype(str).eq("stage1_centroid_fixed_gaussian_covariance").all()
             )
-            if cached_ids == current_ids and fwhm_cache_valid and diff_fwhm_cache_valid and fwhm_consistency_cache_valid and magnitude_cache_valid and host_mag_metadata_cache_valid and legacy_dr9_cache_valid and fwhm_source_cache_valid:
+            if cached_ids == current_ids and cached_uncertain is not None and fwhm_cache_valid and fwhm_error_cache_valid and fwhm_fit_rms_cache_valid and fwhm_chi2_cache_valid and fwhm_filter_cache_valid and diff_fwhm_cache_valid and fwhm_consistency_cache_valid and fwhm_status_cache_valid and magnitude_cache_valid and snr_cache_valid and removed_columns_absent and host_mag_metadata_cache_valid and legacy_dr9_cache_valid and fwhm_source_cache_valid:
                 return cached_host, cached_final
             logging.info(
                 "Recomputing stage4 outputs because cached IDs or diff_fwhm values are stale: %s -> %s",
@@ -1622,6 +2066,14 @@ def stage4_host_mag(stage3_objects: pd.DataFrame, final_class_df: pd.DataFrame, 
             logging.info("Recomputing stage4 outputs because resume=False")
 
     final = stage3_objects.copy()
+    final = final.drop(
+        columns=[
+            "pretrigger_mag_ref",
+            "pretrigger_mag_ref_err",
+            "pretrigger_mag_max_residual",
+        ],
+        errors="ignore",
+    )
     # propagate source pixel centers into final output for downstream use
     if "source_x_px" in final.columns:
         final["detection_x_px"] = final["source_x_px"]
@@ -1634,9 +2086,23 @@ def stage4_host_mag(stage3_objects: pd.DataFrame, final_class_df: pd.DataFrame, 
 
     if final.empty:
         final["fwhm_px"] = np.nan
+        final["fwhm_err_px"] = np.nan
+        final["fwhm_fit_rms"] = np.nan
+        final["fwhm_reduced_chi2"] = np.nan
+        final["fwhm_filter_version"] = 10
+        final["fwhm_ratio"] = np.nan
+        final["fwhm_ratio_min"] = float(fwhm_ratio_min)
+        final["fwhm_ratio_max"] = float(fwhm_ratio_max)
+        final["fwhm_sigma_multiplier"] = float(fwhm_sigma_multiplier)
+        final["psf_spike_delta_chi2_min"] = float(psf_spike_delta_chi2_min)
+        final["psf_amplitude_snr_min"] = float(psf_amplitude_snr_min)
+        final["candidate_snr_min"] = float(candidate_snr_min)
+        final["candidate_snr_max"] = float(candidate_snr_max)
         final["diff_fwhm"] = np.nan
+        final["fwhm_status"] = pd.Series(dtype="object")
         write_csv(final, host_objects_path)
         write_csv(final, final_candidates_path)
+        write_csv(final, uncertain_candidates_path)
         return final, final
 
     final_id_norm = final["object_id"].astype(str).map(normalize_object_id)
@@ -1730,6 +2196,18 @@ def stage4_host_mag(stage3_objects: pd.DataFrame, final_class_df: pd.DataFrame, 
 
     lookup = host_index[[id_col, "e_D_L_fin"]].drop_duplicates(subset=[id_col]).set_index(id_col)["e_D_L_fin"]
     final["e_D_L_fin"] = final_id_norm.map(lookup)
+    for distance_column in ("D_L_low_fin", "D_L_high_fin"):
+        if distance_column in host_index.columns:
+            lookup = (
+                host_index[[id_col, distance_column]]
+                .drop_duplicates(subset=[id_col])
+                .set_index(id_col)[distance_column]
+            )
+            final[distance_column] = final_id_norm.map(lookup)
+        else:
+            final[distance_column] = np.nan
+    final["D_L_lower"] = pd.to_numeric(final["D_L_low_fin"], errors="coerce")
+    final["D_L_upper"] = pd.to_numeric(final["D_L_high_fin"], errors="coerce")
 
     host_rmag_numeric = pd.to_numeric(final["host_rmag"], errors="coerce")
     final["host_rmag_pass"] = host_rmag_numeric.le(float(host_rmag_threshold)) | host_rmag_numeric.isna()
@@ -1768,6 +2246,40 @@ def stage4_host_mag(stage3_objects: pd.DataFrame, final_class_df: pd.DataFrame, 
 
     # 3. Map the per-object maximum SNR into the final DataFrame
     final["best_snr"] = pd.to_numeric(final_id_norm.map(snr_lookup), errors="coerce")
+    stage1_path = out_root / "stage1" / "april_stage1_quadratic_snr_images.csv"
+    stage1 = load_csv_if_exists(stage1_path)
+    if stage1 is None:
+        stage1 = pd.DataFrame(columns=["object_id", "snr", "snr_empirical"])
+    stage1 = stage1.copy()
+    if not stage1.empty:
+        stage1["object_id"] = stage1["object_id"].astype(str).map(normalize_object_id)
+        stage1["snr"] = pd.to_numeric(stage1["snr"], errors="coerce")
+        stage1["snr_empirical"] = pd.to_numeric(stage1["snr_empirical"], errors="coerce")
+    detected_stage1 = stage1[stage1["snr_empirical"] >= 3.0].copy()
+    snr_by_object = detected_stage1.groupby("object_id", sort=False)
+    final["best_snr_normal"] = final_id_norm.map(snr_by_object["snr"].max())
+    final["best_snr_empirical"] = final_id_norm.map(snr_by_object["snr_empirical"].max())
+    final["snr_all"] = final_id_norm.map(
+        snr_by_object["snr"].apply(
+            lambda values: json.dumps([float(value) for value in values.dropna()])
+        )
+    )
+    final["snr_empirical_all"] = final_id_norm.map(
+        snr_by_object["snr_empirical"].apply(
+            lambda values: json.dumps([float(value) for value in values.dropna()])
+        )
+    )
+    if stage1.empty:
+        final["snr"] = np.nan
+        final["snr_empirical"] = np.nan
+    else:
+        best_detection = (
+            stage1.sort_values("snr_empirical", ascending=False)
+            .drop_duplicates("object_id")
+            .set_index("object_id")
+        )
+        final["snr"] = final_id_norm.map(best_detection["snr"])
+        final["snr_empirical"] = final_id_norm.map(best_detection["snr_empirical"])
 
     # Select the stage-3 measurement from the image with the highest SNR for
     # each object, and carry its magnitude and uncertainty into stage 4.
@@ -1838,26 +2350,79 @@ def stage4_host_mag(stage3_objects: pd.DataFrame, final_class_df: pd.DataFrame, 
     stage1_images_path = out_root / "stage1" / "april_stage1_quadratic_snr_images.csv"
     if stage1_images_path.exists():
         stage1_images = pd.read_csv(stage1_images_path, low_memory=False)
-        required_stage1 = {"object_id", "image_path", "source_x_px", "source_y_px", "snr_empirical", "fwhm_px"}
+        required_stage1 = {"object_id", "image_path", "source_x_px", "source_y_px", "snr", "snr_empirical", "fwhm_px"}
         if required_stage1.issubset(stage1_images.columns):
             stage1_images = stage1_images.copy()
             stage1_images["object_id"] = stage1_images["object_id"].astype(str).map(normalize_object_id)
+            stage1_images["snr"] = pd.to_numeric(stage1_images["snr"], errors="coerce")
             stage1_images["snr_empirical"] = pd.to_numeric(stage1_images["snr_empirical"], errors="coerce")
             stage1_images = stage1_images.sort_values("snr_empirical", ascending=False).drop_duplicates("object_id")
             stage1_detection_lookup = stage1_images.set_index("object_id").to_dict("index")
 
     fwhm_values = []
+    fwhm_errors = []
+    fwhm_fit_rms_values = []
+    fwhm_chi2_values = []
+    psf_spike_delta_chi2_values = []
+    psf_amplitude_snr_values = []
+    source_delta_chi2_values = []
+    psf_residual_rms_sigma_values = []
     for _, row in final.iterrows():
         stage1_row = stage1_detection_lookup.get(normalize_object_id(row.get("object_id")), {})
         diff_path = stage1_row.get("image_path", row.get("diff_path"))
         x_px = _safe_float(stage1_row.get("source_x_px", row.get("detection_x_px", np.nan)))
         y_px = _safe_float(stage1_row.get("source_y_px", row.get("detection_y_px", np.nan)))
+        final.at[row.name, "snr"] = _safe_float(stage1_row.get("snr", np.nan))
+        final.at[row.name, "snr_empirical"] = _safe_float(stage1_row.get("snr_empirical", np.nan))
         if not diff_path or not Path(str(diff_path)).exists() or not np.isfinite(x_px) or not np.isfinite(y_px):
             fwhm_values.append(np.nan)
+            fwhm_errors.append(np.nan)
+            fwhm_fit_rms_values.append(np.nan)
+            fwhm_chi2_values.append(np.nan)
+            psf_spike_delta_chi2_values.append(np.nan)
+            psf_amplitude_snr_values.append(np.nan)
+            source_delta_chi2_values.append(np.nan)
+            psf_residual_rms_sigma_values.append(np.nan)
             continue
-        fwhm_values.append(measure_fwhm_from_image(Path(str(diff_path)), x_px, y_px, box_size=21))
+        (
+            measured_fwhm,
+            measured_fwhm_error,
+            fit_rms,
+            reduced_chi2,
+            delta_chi2,
+            amplitude_snr,
+            source_delta_chi2,
+            residual_rms_sigma,
+        ) = measure_fwhm_from_image(
+            Path(str(diff_path)), x_px, y_px, box_size=21
+        )
+        fwhm_values.append(measured_fwhm)
+        fwhm_errors.append(measured_fwhm_error)
+        fwhm_fit_rms_values.append(fit_rms)
+        fwhm_chi2_values.append(reduced_chi2)
+        psf_spike_delta_chi2_values.append(delta_chi2)
+        psf_amplitude_snr_values.append(amplitude_snr)
+        source_delta_chi2_values.append(source_delta_chi2)
+        psf_residual_rms_sigma_values.append(residual_rms_sigma)
     final["fwhm_px"] = fwhm_values
-    final["fwhm_source"] = "stage1_best_snr_centroid"
+    final["fwhm_err_px"] = fwhm_errors
+    final["fwhm_fit_rms"] = fwhm_fit_rms_values
+    final["fwhm_reduced_chi2"] = fwhm_chi2_values
+    final["psf_spike_delta_chi2"] = psf_spike_delta_chi2_values
+    final["psf_amplitude_snr"] = psf_amplitude_snr_values
+    final["source_delta_chi2"] = source_delta_chi2_values
+    final["psf_residual_rms_sigma"] = psf_residual_rms_sigma_values
+    final["fwhm_filter_version"] = 10
+    final["fwhm_ratio_min"] = float(fwhm_ratio_min)
+    final["fwhm_ratio_max"] = float(fwhm_ratio_max)
+    final["fwhm_sigma_multiplier"] = float(fwhm_sigma_multiplier)
+    final["psf_spike_delta_chi2_min"] = float(psf_spike_delta_chi2_min)
+    final["psf_amplitude_snr_min"] = float(psf_amplitude_snr_min)
+    final["source_delta_chi2_min"] = float(source_delta_chi2_min)
+    final["psf_residual_rms_sigma_max"] = float(psf_residual_rms_sigma_max)
+    final["candidate_snr_min"] = float(candidate_snr_min)
+    final["candidate_snr_max"] = float(candidate_snr_max)
+    final["fwhm_source"] = "stage1_centroid_fixed_gaussian_covariance"
 
     # Copy the stage-1 SEEING/FWHM for the selected difference image.  Stage 2
     # may relocate the file, so match by basename rather than full path.
@@ -1871,21 +2436,106 @@ def stage4_host_mag(stage3_objects: pd.DataFrame, final_class_df: pd.DataFrame, 
         lambda value: _safe_float(stage1_detection_lookup.get(normalize_object_id(value), {}).get("fwhm_px", np.nan))
     )
 
-    fwhm_px_numeric = pd.to_numeric(final.get("fwhm_px"), errors="coerce")
-    diff_fwhm_numeric = pd.to_numeric(final.get("diff_fwhm"), errors="coerce")
-    fwhm_abs_delta = (fwhm_px_numeric - diff_fwhm_numeric).abs()
-    # Use a conservative tolerance: 0.5 px floor, with a 15% relative allowance
-    # on larger widths so the gate stays tight enough to reject obviously bad
-    # matches without dropping valid measurements due to tiny numerical drift.
-    fwhm_tolerance = np.maximum(1.0, diff_fwhm_numeric.fillna(0) * 0.15)
-    final["fwhm_pass"] = fwhm_px_numeric.notna() & diff_fwhm_numeric.notna() & fwhm_abs_delta.le(fwhm_tolerance)
-    final["fwhm_reason"] = np.where(
-        fwhm_px_numeric.isna() | diff_fwhm_numeric.isna(),
-        "fwhm_missing",
-        np.where(final["fwhm_pass"], "ok", "fwhm_mismatch"),
+    # PSF-spike ratio and composite visibility score for ranking / optional veto.
+    final["spike_ratio"] = final.apply(
+        lambda row: _compute_spike_ratio_from_image(
+            row.get("diff_path"),
+            _safe_float(row.get("detection_x_px", np.nan)),
+            _safe_float(row.get("detection_y_px", np.nan)),
+            _safe_float(row.get("diff_fwhm", np.nan)),
+        ),
+        axis=1,
+    )
+    final["psf_visibility_score"] = _compute_psf_visibility_score(
+        final["psf_spike_delta_chi2"],
+        final["spike_ratio"],
+        final["fwhm_ratio"] if "fwhm_ratio" in final.columns else pd.Series(np.nan, index=final.index),
     )
 
-    passed = final[final["fwhm_pass"]].copy()
+    fwhm_px_numeric = pd.to_numeric(final.get("fwhm_px"), errors="coerce")
+    fwhm_err_numeric = pd.to_numeric(final.get("fwhm_err_px"), errors="coerce")
+    diff_fwhm_numeric = pd.to_numeric(final.get("diff_fwhm"), errors="coerce")
+    fwhm_measurement_available = fwhm_px_numeric.notna() & diff_fwhm_numeric.notna()
+    fwhm_ratio = fwhm_px_numeric / diff_fwhm_numeric
+    final["fwhm_ratio"] = fwhm_ratio
+    final["psf_visibility_score"] = _compute_psf_visibility_score(
+        final["psf_spike_delta_chi2"],
+        final["spike_ratio"],
+        final["fwhm_ratio"],
+    )
+    fwhm_abs_delta = (fwhm_px_numeric - diff_fwhm_numeric).abs()
+    fwhm_tolerance = float(fwhm_sigma_multiplier) * fwhm_err_numeric
+    final["fwhm_abs_delta"] = fwhm_abs_delta
+    final["fwhm_tolerance"] = fwhm_tolerance
+    fwhm_ratio_pass = fwhm_ratio.between(float(fwhm_ratio_min), float(fwhm_ratio_max))
+    fwhm_uncertainty_pass = fwhm_err_numeric.notna() & fwhm_abs_delta.le(fwhm_tolerance)
+    psf_spike_pass = (
+        pd.to_numeric(final["psf_spike_delta_chi2"], errors="coerce")
+        >= float(psf_spike_delta_chi2_min)
+    )
+    psf_amplitude_pass = (
+        pd.to_numeric(final["psf_amplitude_snr"], errors="coerce")
+        >= float(psf_amplitude_snr_min)
+    )
+    source_delta_chi2_pass = (
+        pd.to_numeric(final["source_delta_chi2"], errors="coerce")
+        >= float(source_delta_chi2_min)
+    )
+    psf_residual_pass = (
+        pd.to_numeric(final["psf_residual_rms_sigma"], errors="coerce")
+        <= float(psf_residual_rms_sigma_max)
+    )
+    final["source_model_pass"] = (
+        source_delta_chi2_pass
+        & psf_amplitude_pass
+        & psf_residual_pass
+    )
+    final["psf_visibility_pass"] = True
+    if psf_visibility_gate_enabled:
+        final["psf_visibility_pass"] = (
+            pd.to_numeric(final["psf_visibility_score"], errors="coerce")
+            >= float(psf_visibility_score_min)
+        )
+    final["fwhm_pass"] = (
+        fwhm_measurement_available
+        & fwhm_ratio_pass
+        & fwhm_uncertainty_pass
+    )
+    final["fwhm_status"] = np.select(
+        [
+            ~fwhm_measurement_available,
+            fwhm_measurement_available & ~fwhm_ratio_pass,
+            fwhm_measurement_available & fwhm_ratio_pass & ~fwhm_uncertainty_pass,
+        ],
+        ["missing", "fwhm_ratio_out_of_range", "fwhm_error_inconsistent"],
+        default="confirmed",
+    )
+    final["fwhm_reason"] = np.select(
+        [
+            ~fwhm_measurement_available,
+            fwhm_measurement_available & ~fwhm_ratio_pass,
+            fwhm_measurement_available & fwhm_ratio_pass & ~fwhm_uncertainty_pass,
+        ],
+        ["fwhm_missing", "fwhm_ratio_out_of_range", "fwhm_error_inconsistent"],
+        default="ok",
+    )
+
+    snr_numeric = pd.to_numeric(final.get("snr_empirical"), errors="coerce")
+    final["candidate_snr_pass"] = snr_numeric.gt(float(candidate_snr_min)) & snr_numeric.lt(float(candidate_snr_max))
+    final["candidate_snr_reason"] = np.select(
+        [
+            snr_numeric.isna(),
+            snr_numeric.le(float(candidate_snr_min)),
+            snr_numeric.ge(float(candidate_snr_max)),
+        ],
+        ["snr_missing", "snr_below_candidate_range", "snr_above_candidate_range"],
+        default="ok",
+    )
+    final["final_pass"] = final["fwhm_pass"] & final["candidate_snr_pass"]
+    if psf_visibility_gate_enabled:
+        final["final_pass"] = final["final_pass"] & final["psf_visibility_pass"]
+    passed = final[final["final_pass"]].copy()
+    uncertain = final.iloc[0:0].copy()
     legacy_columns = {
         "legacy_dr9_status": "missing",
         "legacy_dr9_sep_arcsec": np.nan,
@@ -1916,8 +2566,99 @@ def stage4_host_mag(stage3_objects: pd.DataFrame, final_class_df: pd.DataFrame, 
             final.at[idx, "host_rmag_band"] = "r"
 
     passed = final.loc[passed.index].copy()
+    uncertain = final.loc[uncertain.index].copy()
+    color_rows = []
+    stage3_images_path = out_root / "stage3" / "april_stage3_pretrigger_mag_images.csv"
+    stage3_images = load_csv_if_exists(stage3_images_path)
+    if stage3_images is not None and not passed.empty:
+        final_ids = {
+            normalize_object_id(value)
+            for value in passed["object_id"].tolist()
+        }
+        for object_id, group in stage3_images[
+            (stage3_images.get("phase", "") == "posttrigger")
+            & (stage3_images["object_id"].astype(str).map(normalize_object_id).isin(final_ids))
+        ].groupby(stage3_images["object_id"].astype(str).map(normalize_object_id)):
+            measurements_by_filter: dict[str, list[dict]] = {}
+            for _, item in group.iterrows():
+                filt = str(item.get("filter", "")).lower()
+                mag = _safe_float(item.get("mag", np.nan))
+                upper_limit = _safe_float(item.get("upper_limit", np.nan))
+                obs_time = _parse_filefracday_datetime(item.get("filefracday"))
+                if filt not in {"zg", "zr", "zi"} or pd.isna(obs_time):
+                    continue
+                is_detection = str(item.get("detection", "")).lower() == "true"
+                if is_detection and np.isfinite(mag):
+                    measurements_by_filter.setdefault(filt[-1], []).append(
+                        {"record": item, "time": obs_time, "value": mag, "kind": "measurement"}
+                    )
+                elif not is_detection and np.isfinite(upper_limit):
+                    measurements_by_filter.setdefault(filt[-1], []).append(
+                        {"record": item, "time": obs_time, "value": upper_limit, "kind": "upper_limit"}
+                    )
+            for first_filter, second_filter in (("g", "r"), ("g", "i"), ("r", "i")):
+                for first in measurements_by_filter.get(first_filter, []):
+                    for second in measurements_by_filter.get(second_filter, []):
+                        if first["kind"] == "upper_limit" and second["kind"] == "upper_limit":
+                            # Two non-detections do not constrain their color
+                            # without an additional flux or light-curve model.
+                            continue
+                        first_err = _safe_float(first["record"].get("mag_err", np.nan))
+                        second_err = _safe_float(second["record"].get("mag_err", np.nan))
+                        color_err = (
+                            float(np.hypot(first_err, second_err))
+                            if np.isfinite(first_err) and np.isfinite(second_err)
+                            else np.nan
+                        )
+                        color_name = f"{first_filter}-{second_filter}"
+                        color_mag = float(first["value"] - second["value"])
+                        if first["kind"] == "measurement" and second["kind"] == "measurement":
+                            limit_type = "measurement"
+                        elif first["kind"] == "measurement":
+                            # m_second >= limit_second, hence color <= bound.
+                            limit_type = "upper_limit"
+                        else:
+                            # m_first >= limit_first, hence color >= bound.
+                            limit_type = "lower_limit"
+                        reference = {
+                            "g-r": -0.3,
+                            "r-i": -0.2,
+                        }.get(color_name, np.nan)
+                        color_rows.append({
+                            "object_id": object_id,
+                            "color": color_name,
+                            "first_filter": first_filter,
+                            "second_filter": second_filter,
+                            "first_image_path": first["record"].get("image_path", ""),
+                            "second_image_path": second["record"].get("image_path", ""),
+                            "first_observation_utc": first["time"].isoformat(),
+                            "second_observation_utc": second["time"].isoformat(),
+                            "delta_t_days": abs(
+                                (first["time"] - second["time"]).total_seconds()
+                            ) / 86400.0,
+                            "first_mag_or_limit": first["value"],
+                            "second_mag_or_limit": second["value"],
+                            "color_mag": color_mag,
+                            "color_err": color_err,
+                            "color_limit_type": limit_type,
+                            "color_limit_value": color_mag,
+                            "gw170817_reference_color": reference,
+                            "color_minus_gw170817": (
+                                color_mag - reference if np.isfinite(reference) else np.nan
+                            ),
+                        })
+    colors_path = stage4_dir / "april_stage4_final_candidate_colors.csv"
+    write_csv(pd.DataFrame(color_rows), colors_path)
+    color_counts = pd.DataFrame(color_rows).groupby("object_id").size() if color_rows else pd.Series(dtype="int64")
+    final["n_color_pairs"] = final["object_id"].astype(str).map(
+        color_counts
+    ).fillna(0).astype(int)
+    passed["n_color_pairs"] = passed["object_id"].astype(str).map(
+        color_counts
+    ).fillna(0).astype(int)
     write_csv(final, host_objects_path)
     write_csv(passed, final_candidates_path)
+    write_csv(uncertain, uncertain_candidates_path)
     return final, passed
 
 
@@ -1934,6 +2675,7 @@ def save_stage4_results(
     *,
     max_triplets_per_object: int = 10,
     trigger_datetime=None,
+    trigger_label: str = "Trigger",
 ):
     """Save normalized triplet plots, 1D/3D profiles and SNR light curves for each final candidate.
 
@@ -1961,6 +2703,22 @@ def save_stage4_results(
             stage1_images = _pd.read_csv(stage1_images_path, low_memory=False)
         except Exception:
             stage1_images = None
+
+    triplet_source_positions = {}
+    triplet_objects_path = out_root / "stage2" / "triplets" / "april_stage2_triplets_objects.csv"
+    if triplet_objects_path.exists():
+        try:
+            triplet_objects = _pd.read_csv(triplet_objects_path, low_memory=False)
+            required_position_columns = {"triplet_path", "diff_source_x_px", "diff_source_y_px"}
+            if required_position_columns.issubset(triplet_objects.columns):
+                for _, triplet_row in triplet_objects.iterrows():
+                    source_x = _pd.to_numeric(triplet_row["diff_source_x_px"], errors="coerce")
+                    source_y = _pd.to_numeric(triplet_row["diff_source_y_px"], errors="coerce")
+                    if _np.isfinite(source_x) and _np.isfinite(source_y):
+                        triplet_path_key = str(Path(str(triplet_row["triplet_path"])).resolve())
+                        triplet_source_positions[triplet_path_key] = (float(source_x), float(source_y))
+        except Exception:
+            logging.warning("Could not load exact source positions from %s", triplet_objects_path)
 
     # final_candidates may be None or an empty DataFrame; handle explicitly
     if final_candidates is None or (hasattr(final_candidates, 'empty') and final_candidates.empty):
@@ -2000,6 +2758,15 @@ def save_stage4_results(
         for i, tpath in enumerate(triplet_files[:max_triplets_per_object]):
             parsed = parse_diff_name(tpath.parent.name) or {}
             obs_dt = _parse_filefracday_datetime(parsed.get("filefracday"))
+            source_position = triplet_source_positions.get(str(tpath.resolve()))
+            triplet_center = None
+            if source_position is not None:
+                source_x, source_y = source_position
+                triplet_shape = _np.load(tpath, mmap_mode="r").shape[0]
+                triplet_center = (
+                    triplet_shape // 2 + source_x - round(source_x),
+                    triplet_shape // 2 + source_y - round(source_y),
+                )
             triplet_index_rows.append({
                 "index": i,
                 "diff_image": tpath.parent.name,
@@ -2007,6 +2774,8 @@ def save_stage4_results(
                 "filefracday": parsed.get("filefracday", ""),
                 "obs_datetime": obs_dt,
                 "triplet_path": str(tpath),
+                "stage1_centroid_x_px": triplet_center[0] if triplet_center is not None else _np.nan,
+                "stage1_centroid_y_px": triplet_center[1] if triplet_center is not None else _np.nan,
             })
         if triplet_index_rows:
             _pd.DataFrame(triplet_index_rows).to_csv(obj_dir / "triplet_index.csv", index=False)
@@ -2014,6 +2783,15 @@ def save_stage4_results(
         for i, tpath in enumerate(triplet_files[:max_triplets_per_object]):
             try:
                 trip = _np.load(tpath)
+                mask_path = tpath.with_name("triplet_valid_mask.npy")
+                if mask_path.exists():
+                    valid_masks = _np.asarray(_np.load(mask_path), dtype=bool)
+                    if valid_masks.shape != trip.shape:
+                        raise ValueError(f"Invalid mask shape {valid_masks.shape} for {tpath}")
+                else:
+                    # Compatibility for manually supplied old triplets. The
+                    # sentinel used by _crop and non-finite values are invalid.
+                    valid_masks = _np.isfinite(trip) & (trip != -5000.0)
             except Exception:
                 continue
 
@@ -2021,11 +2799,23 @@ def save_stage4_results(
             planes = []
             for k in range(trip.shape[-1]):
                 p = _np.asarray(trip[..., k], dtype=float)
+                p[~valid_masks[..., k]] = _np.nan
+                if not _np.any(_np.isfinite(p)):
+                    raise ValueError(f"Triplet plane {k} is fully masked")
                 m = _np.nanmedian(p)
                 s = _np.nanstd(p)
                 if not _np.isfinite(s) or s == 0:
                     s = 1.0
                 planes.append((p-m)/s)
+
+            source_position = triplet_source_positions.get(str(tpath.resolve()))
+            if source_position is None:
+                logging.warning("No stage-1 source position for centered profiles of %s", tpath)
+                profile_cx = profile_cy = _np.nan
+            else:
+                source_x, source_y = source_position
+                profile_cx = trip.shape[1] // 2 + source_x - round(source_x)
+                profile_cy = trip.shape[0] // 2 + source_y - round(source_y)
 
             # 3-panel normalized image with flipped ref and smoothed row below
             try:
@@ -2100,18 +2890,56 @@ def save_stage4_results(
 
             # 1D radial profile of diff plane
             try:
+                if not _np.isfinite(profile_cx) or not _np.isfinite(profile_cy):
+                    raise ValueError("Stage-1 centroid position is unavailable")
                 diff = planes[-1]
-                cy, cx = _np.array(diff.shape) // 2
                 yy, xx = _np.indices(diff.shape)
-                r = _np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
-                r_int = r.astype(int).ravel()
-                vals = diff.ravel()
-                tbin = _np.bincount(r_int, weights=vals)
-                cnt = _np.bincount(r_int)
-                radial = tbin / _np.maximum(cnt, 1)
+                dx = xx - profile_cx
+                dy = yy - profile_cy
+                r = _np.sqrt(dx ** 2 + dy ** 2)
+                within_radius = r <= 15.0
+                signed_radius = _np.sign(dx) * _np.floor(r).astype(int)
+                profile_valid = within_radius & valid_masks[..., -1] & _np.isfinite(diff)
+                signed_radius = signed_radius[profile_valid].astype(int)
+                vals = diff[profile_valid]
+                bins = _np.arange(-15, 16)
+                profile = _np.array([
+                    _np.nanmean(vals[signed_radius == radius])
+                    if _np.any(signed_radius == radius)
+                    else _np.nan
+                    for radius in bins
+                ])
                 fig = plt.figure(figsize=(4, 3))
-                plt.plot(radial, marker=".")
-                plt.xlabel("radius (px)")
+                plt.plot(bins, profile, marker=".")
+                fit_mask = _np.isfinite(profile)
+                if _np.count_nonzero(fit_mask) >= 5:
+                    try:
+                        fitted_fwhm = float(cand.get("fwhm_px", _np.nan))
+                        if not _np.isfinite(fitted_fwhm) or fitted_fwhm <= 0:
+                            raise ValueError("Stage-4 Gaussian FWHM is unavailable")
+                        fit_sigma = fitted_fwhm / 2.35482
+                        fit_baseline = float(_np.nanmedian(profile[fit_mask][-5:]))
+                        central_profile = profile[bins == 0]
+                        if central_profile.size == 0 or not _np.isfinite(central_profile[0]):
+                            raise ValueError("radial profile center is unavailable")
+                        fit_amplitude = float(central_profile[0] - fit_baseline)
+                        fit_fwhm = 2.35482 * fit_sigma
+                        dense_bins = _np.linspace(-15, 15, 400)
+                        plt.plot(
+                            dense_bins,
+                            fit_baseline + fit_amplitude * _np.exp(
+                                -0.5 * (dense_bins / fit_sigma) ** 2
+                            ),
+                            color="tab:red",
+                            linewidth=1.5,
+                            label=f"Stage-4 Gaussian fit (FWHM={fit_fwhm:.2f} px)",
+                        )
+                        plt.legend(fontsize=7)
+                    except Exception:
+                        logging.debug("failed Gaussian overlay for radial profile %s", oid)
+                plt.xlim(-15, 15)
+                plt.axvline(0, color="black", linewidth=0.8, alpha=0.6)
+                plt.xlabel("signed radius (px; left / right of center)")
                 plt.ylabel("mean normalized diff")
                 plt.savefig(obj_dir / f"radial_profile_{i}.png", bbox_inches="tight", dpi=400)
                 plt.close(fig)
@@ -2120,13 +2948,53 @@ def save_stage4_results(
 
             # 3D surface plot of diff
             try:
+                if not _np.isfinite(profile_cx) or not _np.isfinite(profile_cy):
+                    raise ValueError("Stage-1 centroid position is unavailable")
                 fig = plt.figure(figsize=(5, 4))
                 ax = fig.add_subplot(111, projection="3d")
                 xs = _np.arange(diff.shape[1])
                 ys = _np.arange(diff.shape[0])
                 X, Y = _np.meshgrid(xs, ys)
-                ax.plot_surface(X, Y, diff, cmap="viridis", linewidth=0, antialiased=False)
-                ax.set_zlim(_np.nanpercentile(diff, 5), _np.nanpercentile(diff, 95))
+                X_offset = X - profile_cx
+                Y_offset = Y - profile_cy
+                surface_radius = _np.sqrt(X_offset ** 2 + Y_offset ** 2)
+                surface_mask = surface_radius <= 15.0
+                surface_mask &= valid_masks[..., -1] & _np.isfinite(diff)
+                surface_values = diff[surface_mask]
+                z_min, z_max = _np.nanpercentile(surface_values, [5, 95])
+                z_span = max(float(z_max - z_min), 1e-6)
+                clipped_surface = _np.clip(diff, z_min, z_max)
+                surface = _np.ma.masked_where(~surface_mask, clipped_surface)
+                marker_z = float(z_max) + 0.2 * z_span
+                center_y = int(round(profile_cy))
+                center_x = int(round(profile_cx))
+                if (
+                    not (0 <= center_y < diff.shape[0] and 0 <= center_x < diff.shape[1])
+                    or not valid_masks[center_y, center_x, -1]
+                    or not _np.isfinite(diff[center_y, center_x])
+                ):
+                    raise ValueError("Diff center is masked or invalid")
+                center_z = float(diff[center_y, center_x])
+                ax.plot_surface(
+                    X_offset, Y_offset, surface, cmap="viridis", linewidth=0,
+                    antialiased=False, alpha=0.72,
+                )
+                ax.plot([0, 0], [0, 0], [center_z, marker_z], color="red", linestyle="--", linewidth=2)
+                ax.scatter(
+                    [0], [0], [marker_z], color="red", edgecolors="white",
+                    marker="*", s=180, depthshade=False, label="stage1 centroid",
+                )
+                ax.set_xlim(-15, 15)
+                ax.set_ylim(-15, 15)
+                ax.set_zlim(float(z_min), marker_z + 0.08 * z_span)
+                ax.set_xlabel("dx (px)", labelpad=2, fontsize=9)
+                ax.set_ylabel("dy (px)", labelpad=2, fontsize=9)
+                ax.set_zlabel("normalized diff (5-95% clipped)", labelpad=2, fontsize=9)
+                ax.tick_params(axis="both", which="major", labelsize=8)
+                ax.tick_params(axis="z", which="major", labelsize=8)
+                ax.set_box_aspect((1, 1, 0.7))
+                ax.view_init(elev=30, azim=-55)
+                ax.legend(loc="upper left", fontsize=8)
                 plt.savefig(obj_dir / f"surface_{i}.png", bbox_inches="tight", dpi=400)
                 plt.close(fig)
             except Exception:
@@ -2222,6 +3090,10 @@ def save_stage4_results(
                     # plotting using real datetimes on X axis and coloring by filter
                     filter_colors = {"zg": "green", "zr": "red", "zi": "orange"}
                     ssel_plot = ssel[ssel["obs_datetime"].notna()].copy()
+                    if trigger_datetime is not None and pd.notna(trigger_datetime):
+                        trigger = pd.to_datetime(trigger_datetime)
+                        cutoff = (trigger - pd.Timedelta(days=1)).normalize()
+                        ssel_plot = ssel_plot[ssel_plot["obs_datetime"] >= cutoff].copy()
                     if not ssel_plot.empty:
                         import matplotlib.dates as mdates
                         from matplotlib.dates import DateFormatter
@@ -2248,26 +3120,24 @@ def save_stage4_results(
                         ax.xaxis.set_major_formatter(formatter)
                         fig.autofmt_xdate(rotation=45, ha='right')
 
-                        # ===== CHANGED PART =====
                         if trigger_datetime is not None and pd.notna(trigger_datetime):
                             trigger = pd.to_datetime(trigger_datetime)
-                            cutoff = (trigger - pd.Timedelta(days=1)).normalize()
-                            cutoff2 = (trigger + pd.Timedelta(days=7)).normalize()
-
-                            # Discard data older than 1 days before trigger
-                            ssel_plot = ssel_plot[ssel_plot["obs_datetime"] >= cutoff].copy()
-
-                            ax.axvline(trigger, color="black", linestyle="--", linewidth=1.2, alpha=0.8, label="Триггер GRB 220219B")
-
-                        #     ax.set_xlim(left=cutoff, right=cutoff2)
-                        # # =========================
+                            ax.axvline(trigger, color="black", linestyle="--", linewidth=1.2, alpha=0.8, label=trigger_label)
 
                         ax.invert_yaxis()
-                        ax.set_ylim(22.0, 20.0)   # magnitude axis: brighter = higher
-                        # ax.set_xlim(
-                        #     pd.Timestamp("2022-02-18"),
-                        #     pd.Timestamp("2022-02-28")
-                        # )
+                        plotted_mags = _pd.concat(
+                            [
+                                ssel_plot.loc[ssel_plot["mag"].notna(), "mag"],
+                                ssel_plot.loc[ssel_plot["upper_limit"].notna(), "upper_limit"],
+                            ],
+                            ignore_index=True,
+                        )
+                        plotted_mags = _pd.to_numeric(plotted_mags, errors="coerce").dropna()
+                        if not plotted_mags.empty:
+                            mag_min = float(plotted_mags.min())
+                            mag_max = float(plotted_mags.max())
+                            margin = max(0.25, 0.08 * (mag_max - mag_min))
+                            ax.set_ylim(mag_max + margin, mag_min - margin)
 
                         ax.set_ylabel("Звёздная величина")
                         ax.set_title(f"Кривая блеска {oid}")
@@ -2282,9 +3152,245 @@ def save_stage4_results(
 
 
 
+def stage5_minor_planet_check(
+    final_candidates: pd.DataFrame,
+    out_root: Path,
+    *,
+    radius_arcmin: float = 5.0,
+    limiting_magnitude: float = 24.0,
+    observatory_code: str = "644",
+    resume: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Cross-match final candidates against known solar-system objects in SkyBoT."""
+    stage5_dir = ensure_dir(out_root / "stage5")
+    candidates_path = stage5_dir / "april_stage5_minor_planet_candidates.csv"
+    matches_path = stage5_dir / "april_stage5_minor_planet_matches.csv"
+    cached_candidates = load_csv_if_exists(candidates_path) if resume else None
+    cached_matches = load_csv_if_exists(matches_path) if resume else None
+
+    object_ids = (
+        final_candidates["object_id"].astype(str).map(normalize_object_id).tolist()
+        if "object_id" in final_candidates.columns
+        else []
+    )
+    if (
+        cached_candidates is not None
+        and cached_matches is not None
+        and {"object_id", "minor_planet_status", "minor_planet_radius_arcmin", "minor_planet_limit_mag", "minor_planet_observatory_code"}.issubset(cached_candidates.columns)
+    ):
+        cached_ids = cached_candidates["object_id"].astype(str).map(normalize_object_id).tolist()
+        settings_match = (
+            pd.to_numeric(cached_candidates["minor_planet_radius_arcmin"], errors="coerce").eq(float(radius_arcmin)).all()
+            and pd.to_numeric(cached_candidates["minor_planet_limit_mag"], errors="coerce").eq(float(limiting_magnitude)).all()
+            and cached_candidates["minor_planet_observatory_code"].astype(str).eq(str(observatory_code)).all()
+        )
+        retry_needed = cached_candidates["minor_planet_status"].astype(str).eq("query_error").any()
+        if cached_ids == object_ids and settings_match and not retry_needed:
+            return cached_candidates, cached_matches
+
+    summary_columns = [
+        "minor_planet_service",
+        "minor_planet_status",
+        "minor_planet_match_count",
+        "minor_planet_bright_match_count",
+        "minor_planet_observation_utc",
+        "minor_planet_search_radius_arcmin",
+        "minor_planet_radius_arcmin",
+        "minor_planet_limit_mag",
+        "minor_planet_observatory_code",
+        "minor_planet_nearest_number",
+        "minor_planet_nearest_name",
+        "minor_planet_nearest_type",
+        "minor_planet_nearest_vmag",
+        "minor_planet_nearest_sep_arcsec",
+        "minor_planet_nearest_posunc_arcsec",
+        "minor_planet_nearest_ra_rate_arcsec_per_hour",
+        "minor_planet_nearest_dec_rate_arcsec_per_hour",
+        "minor_planet_nearest_link",
+        "minor_planet_query_error",
+    ]
+    match_columns = [
+        "object_id",
+        "candidate_image_path",
+        "observation_utc",
+        "number",
+        "name",
+        "type",
+        "vmag",
+        "separation_arcsec",
+        "posunc_arcsec",
+        "ra_rate_arcsec_per_hour",
+        "dec_rate_arcsec_per_hour",
+        "geocentric_distance_au",
+        "heliocentric_distance_au",
+        "link",
+    ]
+    if final_candidates.empty:
+        empty_candidates = final_candidates.copy()
+        for column in summary_columns:
+            empty_candidates[column] = pd.Series(dtype="object")
+        empty_matches = pd.DataFrame(columns=match_columns)
+        write_csv(empty_candidates, candidates_path)
+        write_csv(empty_matches, matches_path)
+        return empty_candidates, empty_matches
+
+    from astropy import units as u
+    from astropy.coordinates import SkyCoord
+    from astropy.time import Time
+    from astroquery.imcce import Skybot
+
+    stage1_path = out_root / "stage1" / "april_stage1_quadratic_snr_images.csv"
+    stage1 = load_csv_if_exists(stage1_path)
+    best_stage1: dict[str, dict] = {}
+    if stage1 is not None and not stage1.empty and {"object_id", "snr", "snr_empirical"}.issubset(stage1.columns):
+        stage1 = stage1.copy()
+        stage1["object_id"] = stage1["object_id"].astype(str).map(normalize_object_id)
+        stage1["snr"] = pd.to_numeric(stage1["snr"], errors="coerce")
+        stage1["snr_empirical"] = pd.to_numeric(stage1["snr_empirical"], errors="coerce")
+        best_rows = stage1.sort_values("snr_empirical", ascending=False).drop_duplicates("object_id")
+        best_stage1 = best_rows.set_index("object_id").to_dict("index")
+
+    def _plain_value(table, column: str, index: int, unit=None):
+        if column not in table.colnames:
+            return np.nan
+        value = table[column][index]
+        if np.ma.is_masked(value):
+            return np.nan
+        if unit is not None and hasattr(value, "to_value"):
+            return float(value.to_value(unit))
+        value = getattr(value, "value", value)
+        if isinstance(value, np.generic):
+            value = value.item()
+        return value
+
+    summary_rows = []
+    match_rows = []
+    for _, candidate in final_candidates.iterrows():
+        object_id = normalize_object_id(candidate.get("object_id"))
+        stage1_row = best_stage1.get(object_id, {})
+        image_value = stage1_row.get("image_path", candidate.get("diff_path", ""))
+        image_path = Path(str(image_value)) if image_value else None
+        parsed = parse_diff_name(image_path.name) if image_path is not None else None
+        obs_datetime = _parse_filefracday_datetime(parsed.get("filefracday")) if parsed else pd.NaT
+
+        ra = _safe_float(stage1_row.get("centroid_ra", candidate.get("detection_ra", np.nan)))
+        dec = _safe_float(stage1_row.get("centroid_dec", candidate.get("detection_dec", np.nan)))
+        if (not np.isfinite(ra) or not np.isfinite(dec)) and parsed is not None:
+            ra = _safe_float(parsed.get("ra"))
+            dec = _safe_float(parsed.get("dec"))
+
+        record = candidate.to_dict()
+        record.update(
+            {
+                "minor_planet_service": "IMCCE SkyBoT",
+                "minor_planet_status": "missing_astrometry",
+                "minor_planet_match_count": 0,
+                "minor_planet_bright_match_count": 0,
+                "minor_planet_observation_utc": obs_datetime.isoformat() if pd.notna(obs_datetime) else "",
+                "minor_planet_search_radius_arcmin": float(radius_arcmin),
+                "minor_planet_radius_arcmin": float(radius_arcmin),
+                "minor_planet_limit_mag": float(limiting_magnitude),
+                "minor_planet_observatory_code": str(observatory_code),
+                "minor_planet_nearest_number": "",
+                "minor_planet_nearest_name": "",
+                "minor_planet_nearest_type": "",
+                "minor_planet_nearest_vmag": np.nan,
+                "minor_planet_nearest_sep_arcsec": np.nan,
+                "minor_planet_nearest_posunc_arcsec": np.nan,
+                "minor_planet_nearest_ra_rate_arcsec_per_hour": np.nan,
+                "minor_planet_nearest_dec_rate_arcsec_per_hour": np.nan,
+                "minor_planet_nearest_link": "",
+                "minor_planet_query_error": "",
+            }
+        )
+
+        if np.isfinite(ra) and np.isfinite(dec) and pd.notna(obs_datetime):
+            try:
+                result = Skybot.cone_search(
+                    SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="icrs"),
+                    float(radius_arcmin) * u.arcmin,
+                    Time(obs_datetime.to_pydatetime(), scale="utc"),
+                    location=str(observatory_code),
+                    position_error=120.0 * u.arcsec,
+                    find_planets=False,
+                    find_asteroids=True,
+                    find_comets=True,
+                    cache=resume,
+                )
+                record["minor_planet_match_count"] = len(result)
+                record["minor_planet_status"] = "match" if len(result) else "no_match"
+                candidate_matches = []
+                for match_index in range(len(result)):
+                    match = {
+                        "object_id": object_id,
+                        "candidate_image_path": str(image_path) if image_path is not None else "",
+                        "observation_utc": record["minor_planet_observation_utc"],
+                        "number": _plain_value(result, "Number", match_index),
+                        "name": _plain_value(result, "Name", match_index),
+                        "type": _plain_value(result, "Type", match_index),
+                        "vmag": _plain_value(result, "V", match_index),
+                        "separation_arcsec": _plain_value(result, "centerdist", match_index, u.arcsec),
+                        "posunc_arcsec": _plain_value(result, "posunc", match_index, u.arcsec),
+                        "ra_rate_arcsec_per_hour": _plain_value(result, "RA_rate", match_index, u.arcsec / u.hour),
+                        "dec_rate_arcsec_per_hour": _plain_value(result, "DEC_rate", match_index, u.arcsec / u.hour),
+                        "geocentric_distance_au": _plain_value(result, "geodist", match_index, u.au),
+                        "heliocentric_distance_au": _plain_value(result, "heliodist", match_index, u.au),
+                        "link": _plain_value(result, "externallink", match_index),
+                    }
+                    vmag = _safe_float(match["vmag"])
+                    if not np.isfinite(vmag) or vmag <= float(limiting_magnitude):
+                        record["minor_planet_bright_match_count"] += 1
+                    candidate_matches.append(match)
+                    match_rows.append(match)
+
+                if candidate_matches:
+                    separations = np.asarray(
+                        [ _safe_float(match["separation_arcsec"]) for match in candidate_matches ],
+                        dtype=float,
+                    )
+                    finite_separations = np.isfinite(separations)
+                    nearest_index = (
+                        int(np.nanargmin(separations))
+                        if finite_separations.any()
+                        else 0
+                    )
+                    nearest = candidate_matches[nearest_index]
+                    record.update(
+                        {
+                            "minor_planet_nearest_number": nearest["number"],
+                            "minor_planet_nearest_name": nearest["name"],
+                            "minor_planet_nearest_type": nearest["type"],
+                            "minor_planet_nearest_vmag": nearest["vmag"],
+                            "minor_planet_nearest_sep_arcsec": nearest["separation_arcsec"],
+                            "minor_planet_nearest_posunc_arcsec": nearest["posunc_arcsec"],
+                            "minor_planet_nearest_ra_rate_arcsec_per_hour": nearest["ra_rate_arcsec_per_hour"],
+                            "minor_planet_nearest_dec_rate_arcsec_per_hour": nearest["dec_rate_arcsec_per_hour"],
+                            "minor_planet_nearest_link": nearest["link"],
+                        }
+                    )
+            except Exception as exc:
+                record["minor_planet_status"] = "query_error"
+                record["minor_planet_query_error"] = str(exc)
+                logging.warning("SkyBoT query failed for object %s: %s", object_id, exc)
+
+        summary_rows.append(record)
+
+    candidates_df = pd.DataFrame(summary_rows)
+    matches_df = pd.DataFrame(match_rows, columns=match_columns)
+    write_csv(candidates_df, candidates_path)
+    write_csv(matches_df, matches_path)
+    return candidates_df, matches_df
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the April candidate pipeline")
     parser.add_argument("--config", default="config.yaml", help="Pipeline config YAML")
+    parser.add_argument(
+        "--stage",
+        choices=("all", "stage0", "stage1", "stage2-triplets", "stage2-braai", "stage3", "stage4", "stage5-minor-planets"),
+        default="all",
+        help="Run only this stage; prerequisite stage CSV outputs must already exist",
+    )
     parser.add_argument("--resume", action="store_true", help="Reuse stage outputs if they already exist")
     parser.add_argument("--force", action="store_true", help="Ignore cached stage outputs and recompute")
     args = parser.parse_args(argv)
@@ -2312,6 +3418,178 @@ def main(argv: list[str] | None = None) -> int:
     final_class_csv = resolve_cli_path(config.get("final_class_csv", "final_class_table_new_(only_in_dist_bounds).csv"))
     model_path = resolve_cli_path(config.get("model_path", "braai/models/braai_d6_m9.h5"))
 
+    def read_stage_csv(relative_path: str, producer: str) -> pd.DataFrame:
+        path = out_root / relative_path
+        cached = load_csv_if_exists(path)
+        if cached is None:
+            raise FileNotFoundError(
+                f"Missing prerequisite output for --stage {args.stage}: {path}. "
+                f"Run --stage {producer} first."
+            )
+        return cached
+
+    def load_final_class() -> pd.DataFrame:
+        return pd.read_csv(final_class_csv, low_memory=False)
+
+    if args.stage != "all":
+        logging.info("Running selected stage: %s", args.stage)
+        if args.stage == "stage0":
+            result = stage0_diff_index(
+                diff_root,
+                out_root,
+                limit_images=int(config.get("limit_images", 0)),
+                object_ids=config.get("object_ids", []),
+                resume=resume,
+            )
+            logging.info("Stage0 complete: %s indexed images", len(result))
+            return 0
+
+        if args.stage == "stage1":
+            diff_index = read_stage_csv("stage0/april_stage0_diff_index.csv", "stage0")
+            stage1_images, _ = stage1_quadratic_snr(
+                diff_index,
+                out_root,
+                final_class_df=load_final_class(),
+                snr_threshold=float(config.get("snr_threshold", 3.0)),
+                sigma=float(config.get("sigma", 3.0)),
+                maxiters=int(config.get("maxiters", 5)),
+                min_valid_pixel=float(config.get("min_valid_pixel", -5000.0)),
+                max_workers=int(config.get("snr_workers", 4)),
+                resume=resume,
+            )
+            logging.info("Stage1 complete: %s measured images", len(stage1_images))
+            return 0
+
+        if args.stage == "stage2-triplets":
+            stage1_images = read_stage_csv(
+                "stage1/april_stage1_quadratic_snr_images.csv", "stage1"
+            )
+            snr_threshold = float(config.get("snr_threshold", 3.0))
+            stage1_pass = stage1_images[
+                pd.to_numeric(stage1_images.get("snr_empirical"), errors="coerce")
+                >= snr_threshold
+            ].copy()
+            manifest_df, complete_df = stage2_triplets(
+                stage1_pass,
+                out_root,
+                sci_root=sci_root,
+                ref_root=ref_root,
+                final_class_df=load_final_class(),
+                download_missing=bool(config.get("download_missing", True)),
+                triplet_size=int(config.get("triplet_size", 63)),
+                ref_flip_lr=bool(config.get("ref_flip_lr", False)),
+                max_workers=int(config.get("max_workers", 4)),
+                chunk_size=int(config.get("chunk_size", 200)),
+                resume=resume,
+            )
+            logging.info(
+                "Stage2 triplets complete: %s manifest rows, %s complete triplets",
+                len(manifest_df),
+                len(complete_df),
+            )
+            return 0
+
+        if args.stage == "stage2-braai":
+            manifest_df = read_stage_csv(
+                "stage2/triplets/april_stage2_triplets_manifest.csv", "stage2-triplets"
+            )
+            complete_df = read_stage_csv(
+                "stage2/triplets/april_stage2_triplets_objects.csv", "stage2-triplets"
+            )
+            scores_df, braai_pass_df = stage2_braai(
+                manifest_df,
+                complete_df,
+                out_root,
+                model_path=model_path,
+                triplet_size=int(config.get("triplet_size", 63)),
+                ref_flip_lr=bool(config.get("ref_flip_lr", False)),
+                braai_threshold=float(config.get("braai_threshold", 0.25)),
+                batch_size=int(config.get("chunk_size", 128)),
+                resume=resume,
+            )
+            logging.info(
+                "Stage2 BRAAI complete: %s scored triplets, %s passing rows",
+                len(scores_df),
+                len(braai_pass_df),
+            )
+            return 0
+
+        if args.stage == "stage3":
+            diff_index = read_stage_csv("stage0/april_stage0_diff_index.csv", "stage0")
+            braai_pass_df = read_stage_csv("stage2/april_stage2_braai_objects.csv", "stage2-braai")
+            _, _, stage3_objects_pass = stage3_pretrigger_magnitude(
+                stage2_objects=braai_pass_df,
+                diff_index=diff_index,
+                diff_root=diff_root,
+                final_class_path=final_class_csv,
+                out_dir=out_root / "stage3",
+                trigger_date=trigger_date_text,
+                lookback_days=int(config.get("lookback_days", 10)),
+                posttrigger_days=int(config.get("posttrigger_days", 10)),
+                sigma=float(config.get("sigma", 3.0)),
+                maxiters=int(config.get("maxiters", 5)),
+                min_valid_pixel=float(config.get("min_valid_pixel", -5000.0)),
+                download_missing=bool(config.get("download_missing", True)),
+                resume=resume,
+            )
+            logging.info("Stage3 complete: %s passing objects", len(stage3_objects_pass))
+            return 0
+
+        if args.stage == "stage5-minor-planets":
+            final_candidates = read_stage_csv(
+                "stage4/april_stage4_final_candidates.csv", "stage4"
+            )
+            checked, matches = stage5_minor_planet_check(
+                final_candidates,
+                out_root,
+                radius_arcmin=float(config.get("minor_planet_radius_arcmin", 5.0)),
+                limiting_magnitude=float(config.get("minor_planet_limit_mag", 24.0)),
+                observatory_code=str(config.get("minor_planet_observatory_code", "644")),
+                resume=resume,
+            )
+            logging.info(
+                "Stage5 minor-planet check complete: %s candidates checked, %s matches",
+                len(checked),
+                len(matches),
+            )
+            return 0
+
+        stage3_objects_pass = read_stage_csv(
+            "stage3/april_stage3_pretrigger_mag_objects.csv", "stage3"
+        )
+        final_class_df = load_final_class()
+        stage4_objects, final_candidates = stage4_host_mag(
+            stage3_objects_pass,
+            final_class_df,
+            out_root,
+            host_rmag_threshold=float(config.get("host_rmag_threshold", 22.5)),
+            fwhm_reduced_chi2_max=float(config.get("fwhm_reduced_chi2_max", 5.0)),
+            fwhm_ratio_min=float(config.get("fwhm_ratio_min", 0.5)),
+            fwhm_ratio_max=float(config.get("fwhm_ratio_max", 1.8)),
+            fwhm_sigma_multiplier=float(config.get("fwhm_sigma_multiplier", 3.0)),
+            psf_spike_delta_chi2_min=float(config.get("psf_spike_delta_chi2_min", 9.0)),
+            psf_amplitude_snr_min=float(config.get("psf_amplitude_snr_min", 3.0)),
+            source_delta_chi2_min=float(config.get("source_delta_chi2_min", 9.0)),
+            psf_residual_rms_sigma_max=float(config.get("psf_residual_rms_sigma_max", 1.5)),
+            candidate_snr_min=float(config.get("candidate_snr_min", 3.0)),
+            candidate_snr_max=float(config.get("candidate_snr_max", 5.0)),
+            psf_visibility_gate_enabled=bool(config.get("psf_visibility_gate_enabled", False)),
+            psf_visibility_score_min=float(config.get("psf_visibility_score_min", 2.362838023766029)),
+            resume=resume,
+        )
+        try:
+            save_stage4_results(
+                final_candidates,
+                final_class_df,
+                out_root,
+                trigger_datetime=trigger_datetime,
+                trigger_label=str(config.get("trigger_label", "Trigger")),
+            )
+        except Exception:
+            logging.exception("Failed to save stage4 results")
+        logging.info("Stage4 complete: %s final candidates", len(final_candidates))
+        return 0
+
     final_class_df = pd.read_csv(final_class_csv, low_memory=False)
 
     diff_index = stage0_diff_index(diff_root, out_root, limit_images=int(config.get("limit_images", 0)), object_ids=config.get("object_ids", []), resume=resume)
@@ -2327,6 +3605,7 @@ def main(argv: list[str] | None = None) -> int:
         sigma=float(config.get("sigma", 3.0)),
         maxiters=int(config.get("maxiters", 5)),
         min_valid_pixel=float(config.get("min_valid_pixel", -5000.0)),
+        max_workers=int(config.get("snr_workers", 4)),
         resume=resume,
     )
     stage1_pass = stage1_images[pd.to_numeric(stage1_images.get("snr_empirical"), errors="coerce") >= float(config.get("snr_threshold", 3.0))].copy()
@@ -2384,14 +3663,49 @@ def main(argv: list[str] | None = None) -> int:
         final_class_df,
         out_root,
         host_rmag_threshold=float(config.get("host_rmag_threshold", 22.5)),
+        fwhm_reduced_chi2_max=float(config.get("fwhm_reduced_chi2_max", 5.0)),
+        fwhm_ratio_min=float(config.get("fwhm_ratio_min", 0.5)),
+        fwhm_ratio_max=float(config.get("fwhm_ratio_max", 1.8)),
+        fwhm_sigma_multiplier=float(config.get("fwhm_sigma_multiplier", 3.0)),
+        psf_spike_delta_chi2_min=float(config.get("psf_spike_delta_chi2_min", 9.0)),
+        psf_amplitude_snr_min=float(config.get("psf_amplitude_snr_min", 3.0)),
+        source_delta_chi2_min=float(config.get("source_delta_chi2_min", 9.0)),
+        psf_residual_rms_sigma_max=float(config.get("psf_residual_rms_sigma_max", 1.5)),
+        candidate_snr_min=float(config.get("candidate_snr_min", 3.0)),
+        candidate_snr_max=float(config.get("candidate_snr_max", 5.0)),
+        psf_visibility_gate_enabled=bool(config.get("psf_visibility_gate_enabled", False)),
+        psf_visibility_score_min=float(config.get("psf_visibility_score_min", 2.362838023766029)),
         resume=resume,
     )
 
     # Save per-candidate results (triplets, profiles, light curves)
     try:
-        save_stage4_results(final_candidates, final_class_df, out_root, trigger_datetime=trigger_datetime)
+        save_stage4_results(
+            final_candidates,
+            final_class_df,
+            out_root,
+            trigger_datetime=trigger_datetime,
+            trigger_label=str(config.get("trigger_label", "Trigger")),
+        )
     except Exception:
         logging.exception("Failed to save stage4 results")
+
+    try:
+        minor_planet_candidates, minor_planet_matches = stage5_minor_planet_check(
+            final_candidates,
+            out_root,
+            radius_arcmin=float(config.get("minor_planet_radius_arcmin", 5.0)),
+            limiting_magnitude=float(config.get("minor_planet_limit_mag", 24.0)),
+            observatory_code=str(config.get("minor_planet_observatory_code", "644")),
+            resume=resume,
+        )
+        logging.info(
+            "Stage5 minor-planet check complete: %s candidates checked, %s matches",
+            len(minor_planet_candidates),
+            len(minor_planet_matches),
+        )
+    except Exception:
+        logging.exception("Failed to run stage5 minor-planet check")
 
     logging.info("Pipeline complete: %s final candidates", len(final_candidates))
     return 0

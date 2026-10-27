@@ -18,11 +18,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 import re
+import warnings
+import warnings
 
 import numpy as np
 import pandas as pd
 from astropy.io import fits
 from astropy.stats import sigma_clipped_stats
+from astropy.utils.exceptions import AstropyUserWarning
+from astropy.utils.exceptions import AstropyUserWarning
 from photutils.aperture import CircularAperture, aperture_photometry
 from photutils.centroids import centroid_quadratic
 
@@ -71,6 +75,13 @@ def _as_float(value):
         return float(value)
     except Exception:
         return np.nan
+
+
+def _unmasked_float(value) -> float:
+    """Convert Astropy masked statistics to plain floats without conversion warnings."""
+    if np.ma.is_masked(value):
+        return np.nan
+    return _as_float(value)
 
 
 def _odd_at_least(value: int, minimum: int) -> int:
@@ -144,7 +155,9 @@ def _conservative_centroid(
         return float(center_x), float(center_y)
 
     try:
-        cx, cy = centroid_quadratic(stamp_pos)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", AstropyUserWarning)
+            cx, cy = centroid_quadratic(stamp_pos)
     except Exception:
         return float(center_x), float(center_y)
 
@@ -191,11 +204,11 @@ def _sample_null_apertures(
 
     h, w = data.shape
     pad = ap_r * 2.0
-    fluxes = []
+    positions = []
     attempts = 0
     max_attempts = n_samples * 20
 
-    while len(fluxes) < n_samples and attempts < max_attempts:
+    while len(positions) < n_samples and attempts < max_attempts:
         attempts += 1
         angle = rng.uniform(0.0, 2.0 * np.pi)
         sep = rng.uniform(min_sep_fwhm, max_sep_fwhm) * fwhm_px
@@ -204,13 +217,22 @@ def _sample_null_apertures(
         if not (pad <= x <= (w - 1 - pad) and pad <= y <= (h - 1 - pad)):
             continue
 
-        cx, cy = _conservative_centroid(data, x, y, fwhm_px, max_shift_fwhm=3.0)
-        aperture = CircularAperture([(cx, cy)], r=ap_r)
-        ap_tbl = aperture_photometry(data, aperture)
-        aperture_sum = float(np.asarray(ap_tbl["aperture_sum"])[0])
-        fluxes.append(aperture_sum - background_median * aperture_area_px)
+        # Null positions intentionally sample background peaks where a valid
+        # quadratic maximum often does not exist; the centroid helper falls
+        # back to the sampled position in those cases.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", AstropyUserWarning)
+            cx, cy = _conservative_centroid(data, x, y, fwhm_px, max_shift_fwhm=3.0)
+        positions.append((cx, cy))
 
-    return np.asarray(fluxes, dtype=float)
+    if not positions:
+        return np.asarray([], dtype=float)
+
+    # Aperture photometry accepts many positions at once; batching avoids one
+    # Photutils table/model construction per null sample without changing centers.
+    aperture = CircularAperture(positions, r=ap_r)
+    aperture_sums = np.asarray(aperture_photometry(data, aperture)["aperture_sum"], dtype=float)
+    return aperture_sums - background_median * aperture_area_px
 
 
 def _empirical_significance(
@@ -237,14 +259,16 @@ def _empirical_significance(
         finite_null, sigma=sigma_clip_sigma, maxiters=sigma_clip_maxiters
     )
 
-    if np.isfinite(null_std) and null_std > 0:
-        snr_empirical = float((net_flux - null_median) / null_std)
+    null_median_value = _unmasked_float(null_median)
+    null_std_value = _unmasked_float(null_std)
+    if np.isfinite(null_std_value) and null_std_value > 0 and np.isfinite(null_median_value):
+        snr_empirical = float((net_flux - null_median_value) / null_std_value)
     else:
         snr_empirical = np.nan
 
     p_value_empirical = float(np.mean(finite_null >= net_flux))
 
-    return float(null_median), float(null_std), snr_empirical, p_value_empirical, n
+    return null_median_value, null_std_value, snr_empirical, p_value_empirical, n
 
 
 def _global_sigma_clipped_background_stats(
@@ -274,7 +298,7 @@ def _global_sigma_clipped_background_stats(
     combined_mask = source_mask | nan_mask | edge_mask
 
     mean, median, std = sigma_clipped_stats(values, mask=combined_mask, sigma=sigma, maxiters=maxiters)
-    return float(mean), float(median), float(std)
+    return _unmasked_float(mean), _unmasked_float(median), _unmasked_float(std)
 
 
 def _sigma_clipped_background_stats(pixels: np.ndarray, sigma: float = 3.0, maxiters: int = 5):
@@ -285,7 +309,7 @@ def _sigma_clipped_background_stats(pixels: np.ndarray, sigma: float = 3.0, maxi
         return np.nan, np.nan, np.nan
 
     mean, median, std = sigma_clipped_stats(pixels, sigma=sigma, maxiters=maxiters)
-    return float(mean), float(median), float(std)
+    return _unmasked_float(mean), _unmasked_float(median), _unmasked_float(std)
 
 
 def _extract_fwhm_px(header, keys: Iterable[str] = FWHM_HEADER_KEYS) -> tuple[float, str]:

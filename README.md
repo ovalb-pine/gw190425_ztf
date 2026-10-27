@@ -24,7 +24,9 @@ The end-to-end workflow is organized into four stages:
 4. Check FWHM consistency against ZTF image metadata and write candidate results.
 
 The SNR implementation also computes an empirical off-source significance using
-the same peak-selection procedure as the source measurement.
+the same peak-selection procedure as the source measurement. While stage 1 is
+running, the terminal displays a progress bar for the empirical SNR
+measurements.
 
 
 ## Repository Layout
@@ -105,6 +107,27 @@ python april_candidate_pipeline.py --config config_validation_ztf22aabjpxh.yaml
 
 Use `--resume` to reuse existing stage outputs or `--force` to recompute them.
 Results are written below the configured `out_root` directory.
+Stage 4 writes FWHM-unconfirmed fits to
+`stage4/april_stage4_fwhm_uncertain_candidates.csv` for review; they are kept
+separate from `stage4/april_stage4_final_candidates.csv`.
+
+To run one stage only, pass `--stage`. Prerequisite stage outputs must already
+exist under the configured `out_root`; if one is missing, the command reports
+which earlier stage to run first. Available values are `stage0`, `stage1`,
+`stage2-triplets`, `stage2-braai`, `stage3`, and `stage4` (the default `all`
+runs the complete pipeline).
+
+For example, after running stages 0 and 1, build triplets only:
+
+```powershell
+python april_candidate_pipeline.py --config config.yaml --stage stage2-triplets
+```
+
+To recompute just stage 4 from the existing stage-3 outputs:
+
+```powershell
+python april_candidate_pipeline.py --config config.yaml --stage stage4 --force
+```
 
 ## Example candidate
 <img width="3268" height="2544" alt="Example candidate diagnostic" src="https://github.com/user-attachments/assets/d311deeb-79a7-4dae-8e1c-2311e44a21d2" />
@@ -126,4 +149,3 @@ This project is licensed under the MIT License. See the
 
 - Duev et al. (2019), BRAAI: [arXiv:1907.11259](https://arxiv.org/abs/1907.11259)
 - Zwicky Transient Facility: [ztf.caltech.edu](https://ztf.caltech.edu/)
-

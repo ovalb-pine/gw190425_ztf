@@ -1,11 +1,33 @@
 # Pipeline configuration
 trigger_date: "2019-04-25"
 trigger_time: "08:18:05"
+trigger_label: "GW190425 trigger"
 lookback_days: 10
 posttrigger_days: 10
 snr_threshold: 3.0
+fwhm_reduced_chi2_max: 5.0
+# Stage-4 morphology cut for marginal (3 < empirical SNR < 5) candidates.
+# Width ratio rejects unresolved spikes and broad artifacts; relative width
+# error rejects noise-dominated Gaussian fits.
+# A PSF-visibility score is also computed for ranking / optional vetoing; keep it
+# disabled by default because it is calibrated on the current 14-object sample and
+# is not a universal science gate.
+fwhm_ratio_min: 0.5
+fwhm_ratio_max: 1.8
+fwhm_sigma_multiplier: 3.0
+psf_spike_delta_chi2_min: 9.0
+psf_amplitude_snr_min: 3.0
+source_delta_chi2_min: 9.0
+psf_residual_rms_sigma_max: 1.5
+psf_visibility_gate_enabled: false
+psf_visibility_score_min: 2.362838023766029
+candidate_snr_min: 3.0
+candidate_snr_max: 5.0
 braai_threshold: 0.25
 host_rmag_threshold: 20.8
+minor_planet_radius_arcmin: 5.0
+minor_planet_limit_mag: 24.0
+minor_planet_observatory_code: "644"  # Palomar Observatory
 sigma: 3.0
 maxiters: 5
 min_valid_pixel: -4000.0
@@ -27,6 +49,7 @@ download_missing: true
 limit_images: 0
 object_ids: []
 max_workers: 4
+snr_workers: 4
 chunk_size: 200
 log_level: "INFO"
 resume: true
