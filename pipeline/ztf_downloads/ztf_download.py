@@ -1,5 +1,6 @@
 import re
 import urllib.parse
+import uuid
 from pathlib import Path
 import requests
 from requests.adapters import HTTPAdapter
@@ -7,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from .utils import _load_json, _save_json
 import math
 import time
+from tqdm import tqdm
 
 """
 Science Exposures File Path Pattern:
@@ -103,36 +105,55 @@ def download_file(url, out_dir="ztf_files", timeout=300, overwrite=False, label=
     out_path = out_dir / fname
 
     if out_path.exists() and not overwrite:
-        return out_path
+        try:
+            if out_path.stat().st_size > 0:
+                return out_path
+        except FileNotFoundError:
+            pass
 
     session = get_session()
+    temp_path = out_path.with_name(f"{out_path.name}.{uuid.uuid4().hex}.part")
     try:
         with session.get(url, stream=True, timeout=timeout) as r:
             r.raise_for_status()
-            with open(out_path, "wb") as f:
+            with temp_path.open("wb") as f:
                 for chunk in r.iter_content(chunk_size=1024*64):
                     if chunk:
                         f.write(chunk)
+        if temp_path.stat().st_size == 0:
+            raise OSError(f"Downloaded empty file from {url}")
+        temp_path.replace(out_path)
         return out_path
     except requests.HTTPError as e:
         if e.response is not None and e.response.status_code == 404:
-            # File not found – skip silently
-            print(f"Skipping 404: {url}")
             return None
         raise
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 
-def batch_download(urls, out_dir="ztf_files", max_workers=6, max_retries=3, retry_delay=5, **dl_kwargs):
+def batch_download(
+    urls,
+    out_dir="ztf_files",
+    max_workers=6,
+    max_retries=3,
+    retry_delay=5,
+    *,
+    progress=None,
+    progress_desc="Downloading",
+    **dl_kwargs,
+):
     """
     Parallel download with per‑file retries.
     Skips files that return 404 (None result) without raising an error.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    urls = list(urls)
 
     downloaded = []
     failed = []
     skipped = []
-    i = 1
 
     def download_with_retry(url, out_dir, label, filtercode):
         last_exc = None
@@ -145,40 +166,54 @@ def batch_download(urls, out_dir="ztf_files", max_workers=6, max_retries=3, retr
                 if attempt == max_retries:
                     raise
                 wait = retry_delay * (2 ** (attempt - 1))
-                print(f"Retry {attempt}/{max_retries} for {url} in {wait}s")
+                tqdm.write(f"Retry {attempt}/{max_retries} for {url} in {wait}s")
                 time.sleep(wait)
         raise last_exc
 
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {}
-        for item in urls:
-            if isinstance(item, (tuple, list)):
-                item_list = list(item) if isinstance(item, tuple) else item
-                url, label, filtercode = (item_list + [None, None, None])[:3]
-            else:
-                url, label, filtercode = item, None, None
-            fut = ex.submit(download_with_retry, url, out_dir, label, filtercode)
-            futures[fut] = (url, label, filtercode)
-
-        for fut in as_completed(futures):
-            url, label, filt = futures[fut]
-            try:
-                p = fut.result()
-                if p is not None:
-                    downloaded.append(str(p))
-                    print(i, "Downloaded:", p.name)
+    own_progress = progress is None
+    progress_bar = (
+        progress
+        if progress is not None
+        else tqdm(
+            total=len(urls),
+            desc=progress_desc,
+            unit="file",
+            dynamic_ncols=True,
+        )
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {}
+            for item in urls:
+                if isinstance(item, (tuple, list)):
+                    item_list = list(item) if isinstance(item, tuple) else item
+                    url, label, filtercode = (item_list + [None, None, None])[:3]
                 else:
-                    skipped.append(url)
-                    print(f"Skipped (404): {url}")
-                i += 1
-            except Exception as e:
-                print("Failed:", url, e)
-                failed.append((url, str(e)))
+                    url, label, filtercode = item, None, None
+                fut = ex.submit(download_with_retry, url, out_dir, label, filtercode)
+                futures[fut] = (url, label, filtercode)
+
+            for fut in as_completed(futures):
+                url, label, filt = futures[fut]
+                try:
+                    p = fut.result()
+                    if p is not None:
+                        downloaded.append(str(p))
+                    else:
+                        skipped.append(url)
+                except Exception as e:
+                    tqdm.write(f"Failed: {url} {e}")
+                    failed.append((url, str(e)))
+                finally:
+                    progress_bar.update(1)
+    finally:
+        if own_progress:
+            progress_bar.close()
 
     if failed:
         raise RuntimeError(f"{len(failed)} downloads failed in this chunk: {failed[:3]}{'...' if len(failed)>3 else ''}")
 
-    print(f"Finished: {len(downloaded)} downloaded, {len(skipped)} skipped (404).")
+    tqdm.write(f"Finished: {len(downloaded)} downloaded, {len(skipped)} skipped (404).")
     return downloaded
 
 def batch_download_resumable(
@@ -203,36 +238,60 @@ def batch_download_resumable(
     completed = set(state.get("completed_chunks", []))
     total_chunks = math.ceil(len(items) / chunk_size)
 
-    for chunk_idx in range(total_chunks):
-        if chunk_idx in completed:
-            continue
+    completed_items = sum(
+        min(chunk_size, len(items) - chunk_idx * chunk_size)
+        for chunk_idx in completed
+        if 0 <= chunk_idx < total_chunks
+    )
+    with tqdm(
+        total=len(items),
+        initial=completed_items,
+        desc="Downloading ZTF cutouts",
+        unit="file",
+        dynamic_ncols=True,
+    ) as progress_bar:
+        for chunk_idx in range(total_chunks):
+            if chunk_idx in completed:
+                continue
 
-        i0 = chunk_idx * chunk_size
-        i1 = min((chunk_idx + 1) * chunk_size, len(items))
-        chunk = items[i0:i1]
+            i0 = chunk_idx * chunk_size
+            i1 = min((chunk_idx + 1) * chunk_size, len(items))
+            chunk = items[i0:i1]
 
-        for attempt in range(1, max_retries + 1):
-            try:
-                print(f"Download chunk {chunk_idx + 1}/{total_chunks} ({i0}:{i1}) attempt {attempt}")
-                batch_download(chunk, out_dir=str(out_dir), max_workers=max_workers)
-                break  # success
-            except Exception as e:
-                if attempt == max_retries:
-                    print(f"Chunk failed after {max_retries} attempts. Saving progress.")
-                    state["last_error"] = str(e)
-                    state["last_failed_chunk"] = chunk_idx
-                    state["completed_chunks"] = sorted(completed)
-                    state["total_chunks"] = total_chunks
-                    _save_json(progress_json, state)
-                    raise
-                wait = retry_delay * (2 ** (attempt - 1))
-                print(f"Retrying chunk in {wait}s due to: {e}")
-                time.sleep(wait)
+            for attempt in range(1, max_retries + 1):
+                try:
+                    tqdm.write(
+                        f"Download chunk {chunk_idx + 1}/{total_chunks} "
+                        f"({i0}:{i1}) attempt {attempt}"
+                    )
+                    batch_download(
+                        chunk,
+                        out_dir=str(out_dir),
+                        max_workers=max_workers,
+                        progress=progress_bar,
+                    )
+                    break
+                except Exception as e:
+                    progress_bar.update(-len(chunk))
+                    if attempt == max_retries:
+                        tqdm.write(
+                            f"Chunk failed after {max_retries} attempts. Saving progress."
+                        )
+                        state["last_error"] = str(e)
+                        state["last_failed_chunk"] = chunk_idx
+                        state["completed_chunks"] = sorted(completed)
+                        state["total_chunks"] = total_chunks
+                        _save_json(progress_json, state)
+                        raise
+                    wait = retry_delay * (2 ** (attempt - 1))
+                    tqdm.write(f"Retrying chunk in {wait}s due to: {e}")
+                    time.sleep(wait)
 
-        completed.add(chunk_idx)
-        state["completed_chunks"] = sorted(completed)
-        state["total_chunks"] = total_chunks
-        state["out_dir"] = str(out_dir)
-        _save_json(progress_json, state)
+            completed.add(chunk_idx)
+            state["completed_chunks"] = sorted(completed)
+            state["total_chunks"] = total_chunks
+            state["total_items"] = len(items)
+            state["out_dir"] = str(out_dir)
+            _save_json(progress_json, state)
 
-    print(f"All chunks complete: {len(items)} items")
+    tqdm.write(f"All chunks complete: {len(items)} items")

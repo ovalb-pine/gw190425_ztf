@@ -11,6 +11,7 @@ import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
@@ -28,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from braai_batch import build_triplet_batch, load_braai_model, predict_braai_batch
 from ztf_downloads.fetch_sci_ref_for_snr import _build_exact_coord_index, compute_host_offset
 from ztf_downloads.snr_photometry_quadratic import process_difference_image, process_difference_images
+from ztf_downloads.blind_detect import collect_full_diff_index, parse_full_diff_name, stage1_blind_search
 from ztf_downloads.ztf_download import build_cutout_url, build_sci_url, build_ref_url, download_file
 
 
@@ -172,7 +174,7 @@ def _norm_key_name(name: str) -> str:
 
 def parse_diff_name(name: str):
     pattern = re.compile(
-        r"(?P<object_id>\d+)_RA(?P<ra>[-+\d\.]+)_DEC(?P<dec>[-+\d\.]+)_"
+        r"(?P<object_id>B?\d+)_RA(?P<ra>[-+\d\.]+)_DEC(?P<dec>[-+\d\.]+)_"
         r"(?P<filter>z[gri])_(?P<filefracday>\d+)__ztf_\d+_"
         r"(?P<field>\d{6})_(?P<filter2>z[gri])_c(?P<ccdid>\d+)_o_q(?P<qid>\d)_scimrefdiffimg"
     )
@@ -471,7 +473,7 @@ from astropy.wcs import WCS
 import numpy as np
 
 
-def _load_image_and_wcs(path):
+def _load_image_and_wcs_uncached(path):
     with fits.open(path, memmap=False) as hdul:
         image_hdu = None
         for hdu in hdul:
@@ -503,6 +505,9 @@ def _load_image_and_wcs(path):
         valid_mask &= np.isfinite(data)
         data[~valid_mask] = np.nan
         return data, WCS(image_hdu.header), valid_mask
+
+
+_load_image_and_wcs = lru_cache(maxsize=6)(_load_image_and_wcs_uncached)
 
 
 def _sky_coordinates_from_pixel(path: Path, x_px: float, y_px: float) -> tuple[float, float] | None:
@@ -639,15 +644,15 @@ def build_triplet(
     return triplet, source_positions, valid_masks
 
 
-def stage0_diff_index(diff_root: Path, out_root: Path, limit_images: int = 0, object_ids: Iterable[str] | None = None, *, resume: bool = True) -> pd.DataFrame:
+def stage0_diff_index(diff_root: Path, out_root: Path, limit_images: int = 0, object_ids: Iterable[str] | None = None, *, resume: bool = True, full_frames: bool = False) -> pd.DataFrame:
     out_path = ensure_dir(out_root / "stage0") / "april_stage0_diff_index.csv"
     if resume:
         cached = load_csv_if_exists(out_path)
         if cached is not None:
             return cached
 
-    df = collect_diff_index(diff_root)
-    if object_ids:
+    df = collect_full_diff_index(diff_root) if full_frames else collect_diff_index(diff_root)
+    if object_ids and not full_frames:
         wanted = {str(_extract_object_id(v)) for v in object_ids if str(v).strip()}
         df = df[df["object_id"].astype(str).isin(wanted)].copy()
     if limit_images and limit_images > 0:
@@ -793,6 +798,33 @@ def stage1_quadratic_snr(
     return merged, summary
 
 
+def run_stage1(diff_index, out_root, config, final_class_df, resume):
+    """Galaxy-position SNR (cutouts) or blind full-frame search, chosen by config['blind_search']."""
+    if bool(config.get("blind_search", False)):
+        return stage1_blind_search(
+            diff_index,
+            out_root,
+            snr_threshold=float(config.get("snr_threshold", 3.0)),
+            min_valid_pixel=float(config.get("min_valid_pixel", -4000.0)),
+            min_detections=int(config.get("blind_min_detections", 1)),
+            min_epochs=int(config.get("blind_min_epochs", 1)),
+            link_radius_arcsec=float(config.get("blind_link_radius_arcsec", 2.0)),
+            max_workers=int(config.get("snr_workers", 4)),
+            resume=resume,
+        )
+    return stage1_quadratic_snr(
+        diff_index,
+        out_root,
+        final_class_df=final_class_df,
+        snr_threshold=float(config.get("snr_threshold", 3.0)),
+        sigma=float(config.get("sigma", 3.0)),
+        maxiters=int(config.get("maxiters", 5)),
+        min_valid_pixel=float(config.get("min_valid_pixel", -5000.0)),
+        max_workers=int(config.get("snr_workers", 4)),
+        resume=resume,
+    )
+
+
 def _make_triplet_manifest_row(row: pd.Series, diff_path: Path, sci_path: Path, ref_path: Path, status: str, ref_sep_arcsec: float, triplet: np.ndarray | None = None) -> dict:
     record = row.to_dict()
     record.update(
@@ -823,6 +855,7 @@ def stage2_triplets(
     max_workers: int,
     chunk_size: int = 200,
     resume: bool = True,
+    full_frames: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     sci_index = build_file_index(sci_root)
     ref_index = build_file_index(ref_root)
@@ -944,19 +977,19 @@ def stage2_triplets(
 
     def build_one(row: pd.Series) -> dict:
         diff_path = Path(row["image_path"])
-        parsed = parse_diff_name(diff_path.name)
+        parsed = parse_diff_name(diff_path.name) or parse_full_diff_name(diff_path.name)
         if parsed is None:
             return _make_triplet_manifest_row(row, diff_path, Path(""), Path(""), "bad_diff_name", np.nan)
 
-        object_id = _extract_object_id(row.get("object_id", parsed["object_id"]))
+        object_id = _extract_object_id(row.get("object_id", parsed.get("object_id", "")))
         coords_from_id = coord_index.get(object_id)
         # Every triplet for this candidate is centered on the SAME fixed sky
         # position (see candidate_center_lookup above), not on a centroid
         # re-measured from this particular image -- otherwise triplets from
         # different detections of the same candidate drift apart by the
         # per-image centroiding noise.
-        ra = _safe_float(row.get("ra", parsed["ra"]))
-        dec = _safe_float(row.get("dec", parsed["dec"]))
+        ra = _safe_float(row.get("ra", parsed.get("ra", np.nan)))
+        dec = _safe_float(row.get("dec", parsed.get("dec", np.nan)))
         coord_source = "snr_or_diff"
         if object_id in candidate_center_lookup:
             ra, dec = candidate_center_lookup[object_id]
@@ -979,18 +1012,23 @@ def stage2_triplets(
         object_label = final_rownum_map.get(object_id, object_id)
         group_dir = ensure_dir(out_root / "stage2" / "triplets" / object_label / diff_path.stem)
         diff_dst = group_dir / "diff" / diff_path.name
-        diff_dst.parent.mkdir(parents=True, exist_ok=True)
-        if diff_path.exists() and not diff_dst.exists():
-            diff_dst.write_bytes(diff_path.read_bytes())
-
         sci_dst = group_dir / "sci" / sci_name
-        sci_dst.parent.mkdir(parents=True, exist_ok=True)
+        if full_frames:
+            # Full frames are ~40 MB: read them in place instead of copying them per candidate.
+            diff_dst = diff_path
+            if sci_src is not None:
+                sci_dst = sci_src
+        else:
+            diff_dst.parent.mkdir(parents=True, exist_ok=True)
+            if diff_path.exists() and not diff_dst.exists():
+                diff_dst.write_bytes(diff_path.read_bytes())
+            sci_dst.parent.mkdir(parents=True, exist_ok=True)
         sci_status = "missing"
         if sci_src is not None and sci_src.exists():
-            if not sci_dst.exists():
+            if not full_frames and not sci_dst.exists():
                 sci_dst.write_bytes(sci_src.read_bytes())
             sci_status = "local"
-        elif download_missing:
+        elif download_missing and not full_frames:
             try:
                 downloaded = download_file(build_cutout_url(sci_url, ra, dec, size_arcsec=240), out_dir=sci_dst.parent)
                 sci_dst = Path(downloaded)
@@ -1014,13 +1052,16 @@ def stage2_triplets(
         ref_name = Path(ref_url).name
         ref_src = ref_index.get(ref_name)
         ref_dst = group_dir / "ref" / ref_name
-        ref_dst.parent.mkdir(parents=True, exist_ok=True)
+        if full_frames and ref_src is not None:
+            ref_dst = ref_src
+        else:
+            ref_dst.parent.mkdir(parents=True, exist_ok=True)
         ref_status = "missing"
         if ref_src is not None and ref_src.exists():
-            if not ref_dst.exists():
+            if not full_frames and not ref_dst.exists():
                 ref_dst.write_bytes(ref_src.read_bytes())
             ref_status = "local"
-        elif download_missing:
+        elif download_missing and not full_frames:
             try:
                 downloaded = download_file(build_cutout_url(ref_url, ra, dec, size_arcsec=240), out_dir=ref_dst.parent)
                 ref_dst = Path(downloaded)
@@ -1365,11 +1406,13 @@ def stage3_pretrigger_magnitude(
     maxiters: int = 5,
     min_valid_pixel: float = -5000.0,
     download_missing: bool = True,
+    full_frames: bool = False,
     resume: bool = True,
 ):
-    from ztf_downloads.ztf_search import metadata_search_resumable
+    from ztf_downloads.ztf_search import metadata_search_batch, metadata_search_resumable
     from ztf_downloads.ztf_download import batch_download_resumable
     from ztf_downloads.ztf_download import build_cutout_url, build_sci_url
+    from ztf_downloads.utils import _save_json
     from urllib.parse import urlparse
 
 
@@ -1381,35 +1424,155 @@ def stage3_pretrigger_magnitude(
         cached_images = load_csv_if_exists(images_path)
         cached_objects = load_csv_if_exists(objects_path)
         if cached_images is not None and cached_objects is not None and not cached_objects.empty:
+            cache_version = 2
+            has_current_cache_version = (
+                "stage1_exposure_match_version" in cached_images.columns
+                and "stage1_exposure_match_version" in cached_objects.columns
+                and pd.to_numeric(
+                    cached_images["stage1_exposure_match_version"], errors="coerce"
+                ).eq(cache_version).all()
+                and pd.to_numeric(
+                    cached_objects["stage1_exposure_match_version"], errors="coerce"
+                ).eq(cache_version).all()
+                and "pretrigger_mag_pass" in cached_objects.columns
+                and "n_posttrigger_detections" in cached_objects.columns
+                and cached_objects["pretrigger_mag_pass"]
+                .astype(str)
+                .str.strip()
+                .str.lower()
+                .isin({"true", "1", "yes"})
+                .all()
+                and pd.to_numeric(
+                    cached_objects.get("n_posttrigger_detections"), errors="coerce"
+                )
+                .gt(0)
+                .all()
+            )
+            if not has_current_cache_version:
+                cached_stage1 = load_csv_if_exists(
+                    out_dir.parent / "stage1" / "april_stage1_quadratic_snr_images.csv"
+                )
+                stage1_lookup = {}
+                if cached_stage1 is not None and {
+                    "object_id",
+                    "image_path",
+                    "source_x_px",
+                    "source_y_px",
+                }.issubset(cached_stage1.columns):
+                    for _, stage1_row in cached_stage1.iterrows():
+                        if not np.isfinite(_safe_float(stage1_row.get("source_x_px"))) or not np.isfinite(
+                            _safe_float(stage1_row.get("source_y_px"))
+                        ):
+                            continue
+                        key = (
+                            normalize_object_id(stage1_row.get("object_id")),
+                            _norm_key_name(Path(str(stage1_row["image_path"])).name),
+                        )
+                        if key[0]:
+                            stage1_lookup[key] = stage1_row.to_dict()
+
+                matched_rows = 0
+                stage1_fields = (
+                    "snr",
+                    "snr_empirical",
+                    "p_value_empirical",
+                    "significance_tier",
+                    "detection",
+                    "mag",
+                    "mag_err",
+                    "upper_limit",
+                )
+                if stage1_lookup and {"object_id", "image_path"}.issubset(cached_images.columns):
+                    for image_idx, image_row in cached_images.iterrows():
+                        key = (
+                            normalize_object_id(image_row.get("object_id")),
+                            _norm_key_name(Path(str(image_row["image_path"])).name),
+                        )
+                        stage1_row = stage1_lookup.get(key)
+                        if stage1_row is None:
+                            continue
+                        for field in stage1_fields:
+                            if field in stage1_row:
+                                value = stage1_row[field]
+                                if field == "detection":
+                                    value = str(value).strip().lower() in {"true", "1", "yes"}
+                                cached_images.at[image_idx, field] = value
+                        if str(stage1_row.get("detection", "")).strip().lower() in {
+                            "true",
+                            "1",
+                            "yes",
+                        }:
+                            cached_images.at[image_idx, "upper_limit"] = np.nan
+                        matched_rows += 1
+
+                if matched_rows:
+                    for object_idx, object_row in cached_objects.iterrows():
+                        object_id = normalize_object_id(object_row.get("object_id"))
+                        object_images = cached_images[
+                            cached_images["object_id"].astype(str).map(normalize_object_id)
+                            == object_id
+                        ]
+                        pre = object_images[object_images["phase"].astype(str) == "pretrigger"]
+                        post = object_images[object_images["phase"].astype(str) == "posttrigger"]
+                        pre_detection = pre.get(
+                            "detection", pd.Series(False, index=pre.index)
+                        ).astype(str).str.strip().str.lower().isin({"true", "1", "yes"})
+                        post_detection = post.get(
+                            "detection", pd.Series(False, index=post.index)
+                        ).astype(str).str.strip().str.lower().isin({"true", "1", "yes"})
+                        n_pre = len(pre)
+                        has_pre_detection = bool(pre_detection.any())
+                        n_post_detections = int(post_detection.sum())
+                        if n_pre == 0:
+                            reason = "no_pretrigger_images"
+                            consistent = False
+                            passed = False
+                        elif has_pre_detection:
+                            reason = "pretrigger_detection"
+                            consistent = False
+                            passed = False
+                        elif n_post_detections == 0:
+                            reason = "no_posttrigger_detections"
+                            consistent = True
+                            passed = False
+                        else:
+                            reason = "no_pretrigger_detections"
+                            consistent = True
+                            passed = True
+                        cached_objects.at[object_idx, "n_pretrigger_images"] = n_pre
+                        cached_objects.at[object_idx, "n_posttrigger_detections"] = n_post_detections
+                        cached_objects.at[object_idx, "pretrigger_mag_consistent"] = consistent
+                        cached_objects.at[object_idx, "pretrigger_mag_pass"] = passed
+                        cached_objects.at[object_idx, "pretrigger_mag_reason"] = reason
+                    cached_objects = cached_objects[
+                        cached_objects["pretrigger_mag_pass"].astype(str).str.strip().str.lower().isin(
+                            {"true", "1", "yes"}
+                        )
+                    ].copy()
+                    cached_images["stage1_exposure_match_version"] = cache_version
+                    cached_objects["stage1_exposure_match_version"] = cache_version
+                    write_csv(cached_images, images_path)
+                    write_csv(cached_objects, objects_path)
+
             cached_ids = set(cached_objects["object_id"].astype(str).map(normalize_object_id)) if "object_id" in cached_objects.columns else set()
-            cached_post_filters = {}
+            cached_post_ids = set()
             if {"object_id", "phase", "filter"}.issubset(cached_images.columns):
                 cached_post = cached_images[cached_images["phase"].astype(str) == "posttrigger"]
-                cached_post = cached_post.copy()
-                cached_post["obs_date"] = cached_post["image_path"].map(
-                    lambda value: _parse_filefracday_datetime(
-                        (parse_diff_name(Path(str(value)).name) or {}).get("filefracday")
-                    )
-                    if "image_path" in cached_post.columns
-                    else pd.NaT
+                cached_post_ids = set(
+                    cached_post["object_id"].astype(str).map(normalize_object_id)
                 )
-                cached_post = cached_post[
-                    (cached_post["obs_date"] >= pd.to_datetime(trigger_date))
-                    & (cached_post["obs_date"] < pd.to_datetime(trigger_date) + pd.Timedelta(days=2))
-                ]
-                for cached_id, group in cached_post.groupby(cached_post["object_id"].astype(str).map(normalize_object_id)):
-                    cached_post_filters[cached_id] = set(group["filter"].dropna().astype(str))
-            cache_has_all_filters = bool(cached_ids) and all(
-                {"zg", "zr", "zi"}.issubset(cached_post_filters.get(cached_id, set()))
-                for cached_id in cached_ids
+            cache_has_posttrigger_data = bool(cached_ids) and cached_ids.issubset(
+                cached_post_ids
             )
             if (
                 {"stage1_centroid_ra", "stage1_centroid_dec"}.issubset(cached_objects.columns)
                 and "snr_empirical" in cached_images.columns
                 and "stage3_coordinate_source" in cached_images.columns
                 and "pretrigger_mag_pass" in cached_objects.columns
+                and "stage1_exposure_match_version" in cached_images.columns
+                and "stage1_exposure_match_version" in cached_objects.columns
                 and cached_objects["pretrigger_mag_pass"].any()
-                and cache_has_all_filters
+                and cache_has_posttrigger_data
             ):
                 passed = cached_objects[cached_objects["pretrigger_mag_pass"]].copy()
                 return cached_images, cached_objects, passed
@@ -1436,6 +1599,10 @@ def stage3_pretrigger_magnitude(
         return _parse_filefracday_datetime(parsed.get("filefracday"))
 
     work["obs_date"] = work["image_path"].map(_parse_obs_date)
+    work_by_object = {
+        object_id: group
+        for object_id, group in work.groupby("object_id", sort=False)
+    }
 
     # Normalize object IDs from stage2_objects and build coordinate lookup directly
     object_ids = []
@@ -1446,7 +1613,6 @@ def stage3_pretrigger_magnitude(
     stage1_images = load_csv_if_exists(stage1_images_path)
     stage1_by_image: dict[str, dict] = {}
     best_stage1_sky: dict[str, tuple[float, float]] = {}
-    best_stage1_image: dict[str, str] = {}
     if stage1_images is not None and "image_path" in stage1_images.columns:
         stage1_images = stage1_images.copy()
         stage1_images["_object_key"] = stage1_images["object_id"].map(normalize_object_id)
@@ -1457,7 +1623,6 @@ def stage3_pretrigger_magnitude(
             "_object_key"
         ).iterrows():
             obj = str(stage1_row.get("_object_key", ""))
-            best_stage1_image[obj] = str(Path(str(stage1_row["image_path"])).resolve())
             ra = _safe_float(stage1_row.get("centroid_ra"))
             dec = _safe_float(stage1_row.get("centroid_dec"))
             if np.isfinite(ra) and np.isfinite(dec):
@@ -1473,8 +1638,12 @@ def stage3_pretrigger_magnitude(
         for _, stage1_row in stage1_images.iterrows():
             sx = _safe_float(stage1_row.get("source_x_px"))
             sy = _safe_float(stage1_row.get("source_y_px"))
-            if np.isfinite(sx) and np.isfinite(sy):
-                image_key = str(Path(str(stage1_row["image_path"])).resolve())
+            object_key = normalize_object_id(stage1_row.get("object_id"))
+            if object_key and np.isfinite(sx) and np.isfinite(sy):
+                image_key = (
+                    object_key,
+                    _norm_key_name(Path(str(stage1_row["image_path"])).name),
+                )
                 stage1_by_image[image_key] = stage1_row.to_dict()
     # sci_path is produced back in stage2 (per-image) but was previously dropped before
     # stage4. stage4 needs the diff image (not sci) to measure fwhm_px, since
@@ -1506,8 +1675,8 @@ def stage3_pretrigger_magnitude(
                 coord_lookup[obj] = (ra, dec)
             else:
                 # If missing, try from work (last resort)
-                obj_rows = work[work["object_id"] == obj]
-                if not obj_rows.empty:
+                obj_rows = work_by_object.get(obj)
+                if obj_rows is not None and not obj_rows.empty:
                     ra = np.nanmedian(obj_rows["ra"])
                     dec = np.nanmedian(obj_rows["dec"])
                     if np.isfinite(ra) and np.isfinite(dec):
@@ -1536,10 +1705,9 @@ def stage3_pretrigger_magnitude(
         return None, "missing_stage1_centroid"
 
     def _reuse_stage1_significance(path: Path, object_id: str, record_dict: dict) -> dict:
-        """Keep the stage-1 result only for the image defining the common anchor."""
-        if best_stage1_image.get(object_id) != str(path.resolve()):
-            return record_dict
-        stage1_row = stage1_by_image.get(str(path.resolve()))
+        """Reuse full-frame significance for the same exposure's archived cutout."""
+        image_key = (object_id, _norm_key_name(path.name))
+        stage1_row = stage1_by_image.get(image_key)
         if stage1_row is None:
             return record_dict
         for field in (
@@ -1559,6 +1727,8 @@ def stage3_pretrigger_magnitude(
                 elif field == "detection":
                     value = str(value).strip().lower() in {"true", "1", "yes"}
                 record_dict[field] = value
+        if str(stage1_row.get("detection", "")).strip().lower() in {"true", "1", "yes"}:
+            record_dict["upper_limit"] = np.nan
         return record_dict
 
     # Load final-class CSV to map object ids -> row numbers for naming
@@ -1567,12 +1737,13 @@ def stage3_pretrigger_magnitude(
     except Exception:
         final_class_df = None
     final_rownum_map = _build_final_rownum_map(final_class_df)
-    # Fixed catalog position per object -- used to CENTER time-window downloads,
-    # so the same physical exposure always gets the same filename/crop no matter
-    # which detection happens to be "best" in a given run. coord_lookup (built
-    # above from ra_used/dec_used) is still used later for reporting the actual
-    # measured detection position; it must not be used to choose download centers.
-    galaxy_coord_lookup = _build_object_coordinate_index(final_class_df)
+    # Full-frame candidates use their best stage-1 centroid and its WCS position;
+    # catalog coordinates are only appropriate for catalog-cutout searches.
+    download_coord_lookup = (
+        best_stage1_sky
+        if full_frames
+        else _build_object_coordinate_index(final_class_df)
+    )
 
     # Identify objects that need pre-trigger downloads and post-trigger downloads.
     # Post-trigger coverage is checked independently for each g/r/i filter,
@@ -1581,7 +1752,7 @@ def stage3_pretrigger_magnitude(
     download_post_needed = {}
     if download_missing:
         for obj in object_ids:
-            obj_work = work[work["object_id"] == obj]
+            obj_work = work_by_object.get(obj, work.iloc[0:0])
             pre = obj_work[(obj_work["obs_date"] < trigger) & (obj_work["obs_date"] >= window_start)]
             if len(pre) == 0:
                 download_needed[obj] = True
@@ -1602,21 +1773,25 @@ def stage3_pretrigger_magnitude(
             len(download_post_needed),
         )
         download_inputs = []
-        for obj in set(list(download_needed.keys()) + list(download_post_needed.keys())):
-            if obj not in galaxy_coord_lookup:
-                logging.warning(f"Could not find galaxy catalog coordinates for object {obj}")
+        metadata_jobs = []
+        for obj in dict.fromkeys([*download_needed, *download_post_needed]):
+            if obj not in download_coord_lookup:
+                coordinate_source = "stage-1 centroid" if full_frames else "galaxy catalog"
+                logging.warning("Could not find %s coordinates for object %s", coordinate_source, obj)
                 continue
-            ra, dec = galaxy_coord_lookup[obj]
+            ra, dec = download_coord_lookup[obj]
 
             obj_norm = normalize_object_id(obj)
             rownum = final_rownum_map.get(obj_norm, obj_norm)
             search_csv = out_dir / f"pretrigger_search_{rownum}.csv"
             search_progress = out_dir / f"pretrigger_search_{rownum}.progress.json"
-            from ztf_downloads.ztf_search import metadata_search_batch
-
             date_start = window_start.strftime("%Y-%m-%d")
             date_end = trigger.strftime("%Y-%m-%d")
-            if obj in download_post_needed and obj not in download_needed:
+            if obj in download_needed and obj in download_post_needed:
+                date_end = posttrigger_window_end.strftime("%Y-%m-%d")
+                search_csv = out_dir / f"allwindow_search_v3_{rownum}.csv"
+                search_progress = out_dir / f"allwindow_search_v3_{rownum}.progress.json"
+            elif obj in download_post_needed:
                 # The archive query uses an exclusive lower date bound. Search
                 # one day earlier so observations on the trigger date are not
                 # discarded before the exact Python-side window check below.
@@ -1626,92 +1801,254 @@ def stage3_pretrigger_magnitude(
                 # files were created during the r/i-only download workflow.
                 search_csv = out_dir / f"posttrigger_search_all_filters_v2_{rownum}.csv"
                 search_progress = out_dir / f"posttrigger_search_all_filters_v2_{rownum}.progress.json"
+            metadata_jobs.append(
+                (obj, obj_norm, ra, dec, search_csv, search_progress, date_start, date_end)
+            )
 
-            def _fetch_meta():
+        def _fetch_meta(job):
+            obj, _, ra, dec, search_csv, search_progress, date_start, date_end = job
+
+            try:
+                return metadata_search_resumable(
+                    positions=[(ra, dec)],
+                    output_csv=str(search_csv),
+                    progress_json=str(search_progress),
+                    batch_size=50,
+                    size_deg=0.01,
+                    product_type="sci",
+                    filtercodes=["zg", "zr", "zi"],
+                    date_start=date_start,
+                    date_end=date_end,
+                    timeout=120,
+                )
+            except Exception as e1:
+                logging.warning("Metadata search initial attempt failed for %s: %s", obj, e1)
+            try:
+                return metadata_search_resumable(
+                    positions=[(ra, dec)],
+                    output_csv=str(search_csv),
+                    progress_json=str(search_progress),
+                    batch_size=50,
+                    size_deg=0.01,
+                    product_type="sci",
+                    filtercodes=["zg", "zr", "zi"],
+                    date_start=date_start,
+                    date_end=date_end,
+                    timeout=300,
+                    max_retries=8,
+                )
+            except Exception as e2:
+                logging.warning("Metadata search extended attempt failed for %s: %s", obj, e2)
+
+            try:
+                parts = []
+                day_start = pd.to_datetime(date_start).normalize()
+                day_end_dt = pd.to_datetime(date_end).normalize()
+                cur = day_start
+                while cur < day_end_dt:
+                    ds = cur.strftime("%Y-%m-%d")
+                    de = (cur + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+                    try:
+                        part = metadata_search_batch(
+                            positions=[(ra, dec)],
+                            size_deg=0.01,
+                            product_type="sci",
+                            ct="csv",
+                            date_start=ds,
+                            date_end=de,
+                            filtercodes=["zg", "zr", "zi"],
+                            timeout=180,
+                        )
+                        if part is None:
+                            part = pd.DataFrame()
+                        parts.append(part)
+                    except Exception as e3:
+                        logging.warning(
+                            "Per-day metadata search failed for %s %s->%s: %s",
+                            obj,
+                            ds,
+                            de,
+                            e3,
+                        )
+                    cur += pd.Timedelta(days=1)
+                if parts:
+                    return pd.concat(parts, ignore_index=True) if any(len(p) for p in parts) else pd.DataFrame()
+            except Exception as e4:
+                logging.warning("Per-day fallback failed for %s: %s", obj, e4)
+
+            return pd.DataFrame()
+
+        def _load_cached_meta(job):
+            _, _, _, _, search_csv, search_progress, _, _ = job
+            if not search_csv.exists() or not search_progress.exists():
+                return None
+            try:
+                state = json.loads(search_progress.read_text(encoding="utf-8"))
+                if int(state.get("total_batches", 0)) != 1:
+                    return None
+                if 0 not in state.get("completed_batches", []):
+                    return None
+                if not search_csv.stat().st_size:
+                    return pd.DataFrame()
+                return pd.read_csv(search_csv, low_memory=False)
+            except (OSError, ValueError, pd.errors.ParserError) as exc:
+                logging.warning("Ignoring unreadable metadata cache %s: %s", search_csv, exc)
+                return None
+
+        def _save_job_meta(job, df_meta):
+            _, _, _, _, search_csv, search_progress, _, _ = job
+            cached = df_meta.copy()
+            if "in_row_id" in cached.columns:
+                cached["in_row_id"] = 1
+            search_csv.parent.mkdir(parents=True, exist_ok=True)
+            cached.to_csv(search_csv, index=False)
+            _save_json(
+                search_progress,
+                {
+                    "completed_batches": [0],
+                    "total_batches": 1,
+                    "output_csv": str(search_csv),
+                    "rows_last_batch": int(len(cached)),
+                },
+            )
+
+        def _fetch_meta_batch(jobs):
+            positions = [(job[2], job[3]) for job in jobs]
+            date_start, date_end = jobs[0][6], jobs[0][7]
+            result = None
+            for timeout in (120, 300):
                 try:
-                    return metadata_search_resumable(
-                        positions=[(ra, dec)],
-                        output_csv=str(search_csv),
-                        progress_json=str(search_progress),
-                        batch_size=50,
+                    result = metadata_search_batch(
+                        positions=positions,
                         size_deg=0.01,
                         product_type="sci",
-                        filtercodes=["zg", "zr", "zi"],
+                        ct="csv",
                         date_start=date_start,
                         date_end=date_end,
-                        timeout=120,
-                    )
-                except Exception as e1:
-                    logging.warning(f"Metadata search initial attempt failed for {obj}: {e1}")
-                try:
-                    return metadata_search_resumable(
-                        positions=[(ra, dec)],
-                        output_csv=str(search_csv),
-                        progress_json=str(search_progress),
-                        batch_size=50,
-                        size_deg=0.01,
-                        product_type="sci",
                         filtercodes=["zg", "zr", "zi"],
-                        date_start=date_start,
-                        date_end=date_end,
-                        timeout=300,
-                        max_retries=8,
+                        timeout=timeout,
                     )
-                except Exception as e2:
-                    logging.warning(f"Metadata search extended attempt failed for {obj}: {e2}")
+                    break
+                except Exception as exc:
+                    logging.warning(
+                        "Batched metadata search failed for %s candidates (timeout=%s): %s",
+                        len(jobs),
+                        timeout,
+                        exc,
+                    )
 
-                try:
-                    parts = []
-                    day_start = pd.to_datetime(date_start).normalize()
-                    day_end_dt = pd.to_datetime(date_end).normalize()
-                    cur = day_start
-                    while cur < day_end_dt:
-                        ds = cur.strftime("%Y-%m-%d")
-                        de = (cur + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-                        try:
-                            part = metadata_search_batch(positions=[(ra, dec)], size_deg=0.01, product_type="sci", ct="csv", date_start=ds, date_end=de, filtercodes=["zg", "zr", "zi"], timeout=180)
-                            if part is None:
-                                part = pd.DataFrame()
-                            parts.append(part)
-                        except Exception as e3:
-                            logging.warning(f"Per-day metadata search failed for {obj} {ds}->{de}: {e3}")
-                        cur += pd.Timedelta(days=1)
-                    if parts:
-                        return pd.concat(parts, ignore_index=True) if any(len(p) for p in parts) else pd.DataFrame()
-                except Exception as e4:
-                    logging.warning(f"Per-day fallback failed for {obj}: {e4}")
+            if result is None:
+                if len(jobs) == 1:
+                    return [(jobs[0], _fetch_meta(jobs[0]))]
+                midpoint = len(jobs) // 2
+                return _fetch_meta_batch(jobs[:midpoint]) + _fetch_meta_batch(jobs[midpoint:])
 
-                return pd.DataFrame()
+            if result.empty:
+                return [(job, result.copy()) for job in jobs]
+            if "in_row_id" not in result.columns:
+                if len(jobs) == 1:
+                    return [(jobs[0], result)]
+                raise ValueError("Batched archive response is missing in_row_id")
 
-            df_meta = _fetch_meta()
+            row_ids = pd.to_numeric(result["in_row_id"], errors="coerce")
+            if row_ids.isna().any() or not row_ids.between(1, len(jobs)).all():
+                raise ValueError("Batched archive response has invalid in_row_id values")
+            result = result.copy()
+            result["_stage3_input_row"] = row_ids.astype(int)
+            return [
+                (
+                    job,
+                    result.loc[result["_stage3_input_row"] == row_number]
+                    .drop(columns=["_stage3_input_row"])
+                    .copy(),
+                )
+                for row_number, job in enumerate(jobs, start=1)
+            ]
+
+        grouped_jobs = {}
+        metadata_results = []
+        for job in metadata_jobs:
+            cached = _load_cached_meta(job)
+            if cached is not None:
+                metadata_results.append((job, cached))
+            else:
+                grouped_jobs.setdefault((job[6], job[7]), []).append(job)
+
+        metadata_batches = []
+        for grouped in grouped_jobs.values():
+            metadata_batches.extend(
+                grouped[start : start + 25]
+                for start in range(0, len(grouped), 25)
+            )
+
+        logging.info(
+            "Fetching archive metadata for %s candidates in %s batches",
+            sum(map(len, grouped_jobs.values())),
+            len(metadata_batches),
+        )
+        worker_count = min(4, len(metadata_batches))
+        with ThreadPoolExecutor(max_workers=max(1, worker_count)) as executor:
+            futures = {
+                executor.submit(_fetch_meta_batch, batch): batch
+                for batch in metadata_batches
+            }
+            for future in as_completed(futures):
+                batch_results = future.result()
+                for job, df_meta in batch_results:
+                    _save_job_meta(job, df_meta)
+                    metadata_results.append((job, df_meta))
+
+        for job, df_meta in metadata_results:
+            obj, obj_norm, _, _, _, _, _, _ = job
             if df_meta is None or df_meta.empty:
-                logging.warning(f"Metadata search yielded no results for {obj}")
+                logging.warning("Metadata search yielded no results for %s", obj)
                 continue
 
             # ztf_search currently does not apply filtercodes server-side.
             # Keep all returned g/r/i rows explicitly for the post-trigger set.
             if obj in download_post_needed and "filtercode" in df_meta.columns:
-                df_meta = df_meta[df_meta["filtercode"].astype(str).str.lower().isin({"g", "r", "i", "zg", "zr", "zi"})].copy()
+                df_meta = df_meta[
+                    df_meta["filtercode"].astype(str).str.lower().isin(
+                        {"g", "r", "i", "zg", "zr", "zi"}
+                    )
+                ].copy()
 
             for _, mrow in df_meta.iterrows():
                 filefracday = mrow.get("filefracday", "")
                 obs_dt = _parse_filefracday_datetime(str(filefracday))
                 if pd.isna(obs_dt):
                     continue
-                if obs_dt < trigger and obj in download_needed:
-                    continue
-                if obs_dt < posttrigger_window_start and obj in download_post_needed:
-                    continue
-                if obs_dt > posttrigger_window_end and obj in download_post_needed:
-                    continue
-                if obj in download_needed and obs_dt >= trigger:
+                in_pretrigger_window = window_start <= obs_dt < trigger
+                in_posttrigger_window = (
+                    posttrigger_window_start
+                    <= obs_dt
+                    <= posttrigger_window_end
+                )
+                should_download_pre = obj in download_needed and in_pretrigger_window
+                should_download_post = (
+                    obj in download_post_needed and in_posttrigger_window
+                )
+                if not (should_download_pre or should_download_post):
                     continue
 
+                in_ra = _safe_float(mrow.get("in_ra"))
+                in_dec = _safe_float(mrow.get("in_dec"))
+                if not np.isfinite(in_ra) or not np.isfinite(in_dec):
+                    logging.warning("Skipping metadata row with invalid coordinates for %s", obj)
+                    continue
                 base_sci_url = build_sci_url(mrow, suffix="scimrefdiffimg.fits.fz")
                 original_fname = Path(urlparse(base_sci_url).path).name
-                url = build_cutout_url(base_sci_url, float(mrow["in_ra"]), float(mrow["in_dec"]), size_arcsec=240)
+                url = build_cutout_url(
+                    base_sci_url,
+                    in_ra,
+                    in_dec,
+                    size_arcsec=240,
+                )
                 filefracday_str = str(int(mrow["filefracday"])).zfill(14)
-                custom_label = f"RA{mrow['in_ra']:.4f}_DEC{mrow['in_dec']:.4f}_{mrow['filtercode']}_{filefracday_str}"
+                custom_label = (
+                    f"RA{in_ra:.4f}_DEC{in_dec:.4f}_"
+                    f"{mrow['filtercode']}_{filefracday_str}"
+                )
                 row_label = final_rownum_map.get(obj_norm, obj_norm)
                 desired_fname = f"{str(row_label)}_{custom_label}__{original_fname}"
                 download_inputs.append((url, desired_fname, str(row_label)))
@@ -1729,23 +2066,47 @@ def stage3_pretrigger_magnitude(
             work = diff_index.copy()
             work["object_id"] = work["object_id"].map(normalize_object_id)
             work["obs_date"] = work["image_path"].map(_parse_obs_date)
+            work_by_object = {
+                object_id: group
+                for object_id, group in work.groupby("object_id", sort=False)
+            }
 
 
     # Now separate pre and post trigger
     pretrigger = work[(work["obs_date"] < trigger) & (work["obs_date"] >= window_start)].copy()
     posttrigger = work[(work["obs_date"] >= trigger) & (work["obs_date"] <= posttrigger_window_end)].copy()
+    pretrigger_by_object = {
+        object_id: group
+        for object_id, group in pretrigger.groupby("object_id", sort=False)
+    }
+    posttrigger_by_object = {
+        object_id: group
+        for object_id, group in posttrigger.groupby("object_id", sort=False)
+    }
 
     image_rows = []
     object_rows = []
+    measurement_progress = tqdm(
+        total=len(pretrigger) + len(posttrigger),
+        desc="Measuring stage-3 cutouts",
+        unit="image",
+        dynamic_ncols=True,
+    )
+
+    def _progress_rows(frame):
+        for item in frame.iterrows():
+            yield item
+            measurement_progress.update(1)
+
     for object_id in object_ids:
-        group = pretrigger[pretrigger["object_id"] == object_id].copy()
-        object_post = posttrigger[posttrigger["object_id"] == object_id].copy()
+        group = pretrigger_by_object.get(object_id, pretrigger.iloc[0:0])
+        object_post = posttrigger_by_object.get(object_id, posttrigger.iloc[0:0])
 
         # Measure post-trigger magnitudes
         post_mags = []
         post_mag_errs = []
         post_records = []
-        for _, row in object_post.iterrows():
+        for _, row in _progress_rows(object_post):
             path = Path(row["image_path"])
             if not path.exists():
                 continue
@@ -1773,10 +2134,14 @@ def stage3_pretrigger_magnitude(
                 post_mags.append(float(record_dict["mag"]))
                 if np.isfinite(record_dict.get("mag_err", np.nan)):
                     post_mag_errs.append(float(record_dict["mag_err"]))
+        post_detection_count = sum(
+            str(record.get("detection", "")).strip().lower() in {"true", "1", "yes"}
+            for record in post_records
+        )
 
         # Measure pre-trigger magnitudes
         pre_records = []
-        for _, row in group.iterrows():
+        for _, row in _progress_rows(group):
             path = Path(row["image_path"])
             if not path.exists():
                 continue
@@ -1818,7 +2183,8 @@ def stage3_pretrigger_magnitude(
         post_ref_mag = float(np.nanmedian(post_mags)) if post_mags else np.nan
         post_ref_err = float(np.nanmedian(post_mag_errs)) if post_mag_errs else np.nan
 
-        # Determine pass/fail: require that there are pre-trigger images and none show a detection.
+        # A final candidate needs pre-trigger coverage without detections and at
+        # least one post-trigger detection.
         n_pre = len(group)
         if n_pre == 0:
             # No pre-trigger images -> cannot confirm transient is caused by trigger
@@ -1827,22 +2193,29 @@ def stage3_pretrigger_magnitude(
             reason = "no_pretrigger_images"
         else:
             # Check whether any pre-trigger record had a detection
-            pre_detections = [r for r in pre_records if bool(r.get("detection")) and np.isfinite(r.get("mag", np.nan))]
+            pre_detections = [
+                r for r in pre_records
+                if str(r.get("detection", "")).strip().lower() in {"true", "1", "yes"}
+            ]
             if pre_detections:
                 # There was at least one detection before the trigger -> fail
                 consistent = False
                 pass_flag = False
                 reason = "pretrigger_detection"
+            elif post_detection_count == 0:
+                consistent = True
+                pass_flag = False
+                reason = "no_posttrigger_detections"
             else:
-                # No detections pre-trigger -> pass
+                # Clean pre-trigger history and a post-trigger detection -> pass
                 consistent = True
                 pass_flag = True
                 reason = "no_pretrigger_detections"
 
         object_image_records = [
-            record for record in image_rows
-            if normalize_object_id(record.get("object_id", "")) == object_id
-            and np.isfinite(_safe_float(record.get("snr_empirical", np.nan)))
+            record
+            for record in (*post_records, *pre_records)
+            if np.isfinite(_safe_float(record.get("snr_empirical", np.nan)))
         ]
         best_image_record = max(
             object_image_records,
@@ -1856,8 +2229,8 @@ def stage3_pretrigger_magnitude(
         if object_id in coord_lookup:
             dra, ddec = coord_lookup[object_id]
         else:
-            obj_rows = work[work["object_id"] == object_id]
-            if not obj_rows.empty:
+            obj_rows = work_by_object.get(object_id)
+            if obj_rows is not None and not obj_rows.empty:
                 dra = np.nanmedian(obj_rows["ra"]) if "ra" in obj_rows.columns else np.nan
                 ddec = np.nanmedian(obj_rows["dec"]) if "dec" in obj_rows.columns else np.nan
         object_rows.append({
@@ -1870,7 +2243,7 @@ def stage3_pretrigger_magnitude(
             "posttrigger_reference_kind": "posttrigger_median",
             "posttrigger_reference_mag": post_ref_mag,
             "posttrigger_reference_mag_err": post_ref_err,
-            "n_posttrigger_detections": int(len(post_mags)),
+            "n_posttrigger_detections": int(post_detection_count),
             "source_x_px": sx,
             "source_y_px": sy,
             "detection_ra": dra,
@@ -1880,9 +2253,13 @@ def stage3_pretrigger_magnitude(
             "diff_path": diff_path_lookup.get(object_id, ""),
         })
 
+    measurement_progress.close()
     mag_df = pd.DataFrame(image_rows)
     stage3_objects_all = pd.DataFrame(object_rows)
     stage3_objects_pass = stage3_objects_all[stage3_objects_all["pretrigger_mag_pass"]].copy() if "pretrigger_mag_pass" in stage3_objects_all.columns else stage3_objects_all.iloc[0:0].copy()
+    mag_df["stage1_exposure_match_version"] = 2
+    stage3_objects_all["stage1_exposure_match_version"] = 2
+    stage3_objects_pass["stage1_exposure_match_version"] = 2
 
     write_csv(mag_df, images_path)
     write_csv(stage3_objects_pass, objects_path)
@@ -1907,7 +2284,6 @@ def _compute_spike_ratio_from_image(
         return np.nan
     try:
         from astropy.io import fits
-        import numpy as np
 
         data = fits.getdata(str(diff_path), memmap=False)
         arr = np.asarray(data, dtype=float)
@@ -2704,6 +3080,18 @@ def save_stage4_results(
         except Exception:
             stage1_images = None
 
+    stage3_images_path = out_root / "stage3" / "april_stage3_pretrigger_mag_images.csv"
+    stage3_images = None
+    if stage3_images_path.exists():
+        try:
+            stage3_images = _pd.read_csv(stage3_images_path, low_memory=False)
+        except Exception as exc:
+            logging.warning(
+                "Could not load stage-3 photometry for light curves from %s: %s",
+                stage3_images_path,
+                exc,
+            )
+
     triplet_source_positions = {}
     triplet_objects_path = out_root / "stage2" / "triplets" / "april_stage2_triplets_objects.csv"
     if triplet_objects_path.exists():
@@ -2733,12 +3121,13 @@ def save_stage4_results(
 
         # find triplet.npy files for this candidate
         triplet_files = []
-        candidate_dir = triplet_root / str(label)
-        if candidate_dir.exists():
-            triplet_files = list(candidate_dir.rglob("triplet.npy"))
-        if not triplet_files:
-            # fallback: search anywhere for directory matching oid
-            triplet_files = list(triplet_root.rglob(f"*{oid}*/triplet.npy"))
+        if max_triplets_per_object > 0:
+            candidate_dir = triplet_root / str(label)
+            if candidate_dir.exists():
+                triplet_files = list(candidate_dir.rglob("triplet.npy"))
+            if not triplet_files:
+                # fallback: search anywhere for directory matching oid
+                triplet_files = list(triplet_root.rglob(f"*{oid}*/triplet.npy"))
 
         # Each triplet lives in a directory named after its source diff image
         # (parent dir name == diff_path.stem), which encodes the epoch/filter.
@@ -3000,154 +3389,218 @@ def save_stage4_results(
             except Exception:
                 logging.debug("failed 3d surface for %s", oid)
 
-            # light curve: magnitude vs time from stage3 pretrigger mag images (preferred)
-            try:
-                stage3_images_path = out_root / "stage3" / "april_stage3_pretrigger_mag_images.csv"
-                s3 = None
-                if stage3_images_path.exists():
+        # light curve: magnitude vs time from stage3 pretrigger mag images (preferred)
+        try:
+            stage1_detections_without_mag = 0
+            if stage3_images is not None:
+                ssel = stage3_images[
+                    stage3_images["object_id"].astype(str).map(normalize_object_id) == oid
+                ].copy()
+            else:
+                ssel = _pd.DataFrame()
+
+            if ssel.empty and stage1_images is not None:
+                ssel = stage1_images[stage1_images["object_id"].astype(str).map(normalize_object_id) == oid].copy()
+
+            if stage1_images is not None and not stage1_images.empty:
+                stage1_for_object = stage1_images[
+                    stage1_images["object_id"].astype(str).map(normalize_object_id) == oid
+                ].copy()
+                stage1_for_object["mag"] = _pd.to_numeric(
+                    stage1_for_object.get("mag"), errors="coerce"
+                )
+                stage1_for_object["mag_err"] = _pd.to_numeric(
+                    stage1_for_object.get("mag_err"), errors="coerce"
+                )
+                detected = stage1_for_object.get("detection", _pd.Series(False, index=stage1_for_object.index))
+                stage1_for_object = stage1_for_object[
+                    detected.astype(str).str.strip().str.lower().isin({"true", "1", "yes"})
+                ].copy()
+                if not stage1_for_object.empty:
+                    stage1_detections_without_mag = int(stage1_for_object["mag"].isna().sum())
+                    def _plot_observation_key(row):
+                        def _normalize(value):
+                            if _pd.isna(value):
+                                return ""
+                            text = str(value).strip()
+                            return text[:-2] if text.endswith(".0") else text
+
+                        parsed = parse_diff_name(Path(str(row.get("image_path", ""))).name) or {}
+                        return (
+                            _normalize(row.get("filefracday", parsed.get("filefracday"))),
+                            _normalize(row.get("filter", parsed.get("filter"))),
+                            _normalize(row.get("field", parsed.get("field"))),
+                            _normalize(row.get("ccdid", parsed.get("ccdid"))),
+                            _normalize(row.get("qid", parsed.get("qid"))),
+                        )
+
+                    stage1_for_object["upper_limit"] = _np.nan
+                    detection_keys = set(
+                        stage1_for_object.apply(_plot_observation_key, axis=1)
+                    )
+                    if not ssel.empty:
+                        ssel = ssel[
+                            ~ssel.apply(_plot_observation_key, axis=1).isin(detection_keys)
+                        ].copy()
+                    stage1_plot_detections = stage1_for_object[
+                        stage1_for_object["mag"].notna()
+                    ].copy()
+                    ssel = _pd.concat(
+                        [ssel, stage1_plot_detections], ignore_index=True, sort=False
+                    )
+
+            if not ssel.empty:
+                # prefer magnitudes if available, otherwise use SNR as fallback
+                ssel["mag"] = _pd.to_numeric(ssel.get("mag"), errors="coerce")
+                ssel["mag_err"] = _pd.to_numeric(ssel.get("mag_err"), errors="coerce")
+                ssel["upper_limit"] = _pd.to_numeric(ssel.get("upper_limit"), errors="coerce")
+                ssel["snr_empirical"] = _pd.to_numeric(ssel.get("snr_empirical"), errors="coerce")
+
+                def _get_filefracday(row):
+                    value = row.get("filefracday")
+                    if _pd.notna(value):
+                        text = str(value).strip()
+                        if text.endswith(".0"):
+                            text = text[:-2]
+                        if len(text) >= 8 and text[:8].isdigit():
+                            return text
+                    parsed = parse_diff_name(Path(str(row.get("image_path", ""))).name)
+                    return parsed.get("filefracday") if parsed else None
+
+                # Extract filefracday-derived fractional day for plotting (day-of-year + fraction)
+                def _extract_t_frac(row):
                     try:
-                        s3 = _pd.read_csv(stage3_images_path, low_memory=False)
+                        filefracday = _get_filefracday(row)
+                        if filefracday:
+                            dt = _parse_filefracday_datetime(filefracday)
+                            if pd.notna(dt):
+                                return float(dt.dayofyear) + (dt.hour * 3600 + dt.minute * 60 + dt.second + dt.microsecond / 1e6) / 86400.0
                     except Exception:
-                        s3 = None
+                        pass
+                    return _np.nan
 
-                if s3 is not None:
-                    ssel = s3[s3["object_id"].astype(str).map(normalize_object_id) == oid].copy()
-                else:
-                    ssel = _pd.DataFrame()
+                ssel["t_frac"] = ssel.apply(_extract_t_frac, axis=1)
 
-                if ssel.empty and stage1_images is not None:
-                    # fallback to stage1 SNR-driven table (no mags available)
-                    ssel = stage1_images[stage1_images["object_id"].astype(str).map(normalize_object_id) == oid].copy()
+                # Extract human date and filter label for xticks and color grouping
+                def _extract_date_filter_label(row):
+                    try:
+                        ffd = _get_filefracday(row)
+                        if ffd:
+                            if len(ffd) >= 8:
+                                d = ffd[:8]
+                                filt = row.get("filter")
+                                if _pd.isna(filt):
+                                    parsed = parse_diff_name(Path(str(row.get("image_path", ""))).name)
+                                    filt = parsed.get("filter", "?") if parsed else "?"
+                                return f"{d[0:4]}-{d[4:6]}-{d[6:8]} ({filt})"
+                    except Exception:
+                        pass
+                    return Path(str(row.get("image_path", ""))).name
 
-                if not ssel.empty:
-                    # prefer magnitudes if available, otherwise use SNR as fallback
-                    ssel["mag"] = _pd.to_numeric(ssel.get("mag"), errors="coerce")
-                    ssel["mag_err"] = _pd.to_numeric(ssel.get("mag_err"), errors="coerce")
-                    ssel["upper_limit"] = _pd.to_numeric(ssel.get("upper_limit"), errors="coerce")
-                    ssel["snr_empirical"] = _pd.to_numeric(ssel.get("snr_empirical"), errors="coerce")
+                ssel["date_label"] = ssel.apply(_extract_date_filter_label, axis=1)
 
-                    # Extract filefracday-derived fractional day for plotting (day-of-year + fraction)
-                    def _extract_t_frac(pth):
-                        try:
-                            name = Path(str(pth)).name
-                            parsed = parse_diff_name(name)
-                            if parsed and parsed.get("filefracday"):
-                                dt = _parse_filefracday_datetime(parsed["filefracday"])
-                                if pd.notna(dt):
-                                    return float(dt.dayofyear) + (dt.hour * 3600 + dt.minute * 60 + dt.second + dt.microsecond / 1e6) / 86400.0
-                        except Exception:
-                            pass
-                        return _np.nan
+                # Prefer a precise datetime parsed from filefracday when available
+                def _extract_obs_datetime(row):
+                    try:
+                        filefracday = _get_filefracday(row)
+                        if filefracday:
+                            return _parse_filefracday_datetime(filefracday)
+                    except Exception:
+                        pass
+                    return _pd.NaT
 
-                    ssel["t_frac"] = ssel.get("image_path").apply(_extract_t_frac)
+                ssel["obs_datetime"] = ssel.apply(_extract_obs_datetime, axis=1)
 
-                    # Extract human date and filter label for xticks and color grouping
-                    def _extract_date_filter_label(pth):
-                        try:
-                            name = Path(str(pth)).name
-                            parsed = parse_diff_name(name)
-                            if parsed and parsed.get("filefracday"):
-                                ffd = str(parsed["filefracday"]).strip()
-                                if len(ffd) >= 8:
-                                    d = ffd[:8]
-                                    return f"{d[0:4]}-{d[4:6]}-{d[6:8]} ({parsed.get('filter', '?')})"
-                        except Exception:
-                            pass
-                        return Path(str(pth)).name
+                # For any rows missing precise datetime, fall back to the date parsed from the label
+                mask_na = ssel["obs_datetime"].isna()
+                if mask_na.any():
+                    ssel.loc[mask_na, "obs_datetime"] = ssel.loc[mask_na, "date_label"].apply(lambda dl: _pd.to_datetime(dl[:10], errors="coerce") if isinstance(dl, str) else _pd.NaT)
 
-                    ssel["date_label"] = ssel.get("image_path").apply(_extract_date_filter_label)
+                # Extract filter from filename (more robust than regex on date_label)
+                def _extract_filter(row):
+                    value = row.get("filter")
+                    if _pd.notna(value):
+                        return str(value).lower()
+                    try:
+                        parsed = parse_diff_name(Path(str(row.get("image_path", ""))).name)
+                        if parsed:
+                            return parsed.get("filter")
+                    except Exception:
+                        pass
+                    return None
 
-                    # Prefer a precise datetime parsed from filefracday when available
-                    def _extract_obs_datetime(pth):
-                        try:
-                            name = Path(str(pth)).name
-                            parsed = parse_diff_name(name)
-                            if parsed and parsed.get("filefracday"):
-                                return _parse_filefracday_datetime(parsed["filefracday"])
-                        except Exception:
-                            pass
-                        return _pd.NaT
+                ssel["filt"] = ssel.apply(_extract_filter, axis=1)
 
-                    ssel["obs_datetime"] = ssel.get("image_path").apply(_extract_obs_datetime)
+                # plotting using real datetimes on X axis and coloring by filter
+                filter_colors = {"zg": "green", "zr": "red", "zi": "orange"}
+                ssel_plot = ssel[ssel["obs_datetime"].notna()].copy()
+                if trigger_datetime is not None and pd.notna(trigger_datetime):
+                    trigger = pd.to_datetime(trigger_datetime)
+                    cutoff = (trigger - pd.Timedelta(days=1)).normalize()
+                    ssel_plot = ssel_plot[ssel_plot["obs_datetime"] >= cutoff].copy()
+                if not ssel_plot.empty:
+                    import matplotlib.dates as mdates
+                    from matplotlib.dates import DateFormatter
 
-                    # For any rows missing precise datetime, fall back to the date parsed from the label
-                    mask_na = ssel["obs_datetime"].isna()
-                    if mask_na.any():
-                        ssel.loc[mask_na, "obs_datetime"] = ssel.loc[mask_na, "date_label"].apply(lambda dl: _pd.to_datetime(dl[:10], errors="coerce") if isinstance(dl, str) else _pd.NaT)
+                    fig, ax = plt.subplots(figsize=(9, 4))
+                    for filt, color in filter_colors.items():
+                        mask_f = ssel_plot["filt"] == filt
+                        if mask_f.any():
+                            det = ssel_plot[mask_f & ssel_plot["mag"].notna() & (ssel_plot["snr_empirical"] >= 3)]
+                            if not det.empty:
+                                ax.errorbar(det["obs_datetime"].values, det["mag"].values, yerr=det.get("mag_err"), fmt="o", color=color, label=f"Обнаружение ({filt})")
+                            ul = ssel_plot[mask_f & ssel_plot["upper_limit"].notna()]
+                            if not ul.empty:
+                                ax.scatter(ul["obs_datetime"].values, ul["upper_limit"].values, marker="v", color=color, s=60, alpha=0.6, label=f"Верхний предел ({filt})")
 
-                    # Extract filter from filename (more robust than regex on date_label)
-                    def _extract_filter(pth):
-                        try:
-                            parsed = parse_diff_name(Path(str(pth)).name)
-                            if parsed:
-                                return parsed.get("filter")
-                        except Exception:
-                            pass
-                        return None
+                    # xticks: use a date locator/formatter so labels do not overlap
+                    import matplotlib.dates as mdates
+                    from matplotlib.dates import DateFormatter
 
-                    ssel["filt"] = ssel.get("image_path").apply(_extract_filter)
+                    locator = mdates.AutoDateLocator()
+                    # Keep explicit year-month-day labels and suppress time text.
+                    formatter = mdates.DateFormatter("%Y-%m-%d")
+                    ax.xaxis.set_major_locator(locator)
+                    ax.xaxis.set_major_formatter(formatter)
+                    fig.autofmt_xdate(rotation=45, ha='right')
 
-                    # plotting using real datetimes on X axis and coloring by filter
-                    filter_colors = {"zg": "green", "zr": "red", "zi": "orange"}
-                    ssel_plot = ssel[ssel["obs_datetime"].notna()].copy()
                     if trigger_datetime is not None and pd.notna(trigger_datetime):
                         trigger = pd.to_datetime(trigger_datetime)
-                        cutoff = (trigger - pd.Timedelta(days=1)).normalize()
-                        ssel_plot = ssel_plot[ssel_plot["obs_datetime"] >= cutoff].copy()
-                    if not ssel_plot.empty:
-                        import matplotlib.dates as mdates
-                        from matplotlib.dates import DateFormatter
+                        ax.axvline(trigger, color="black", linestyle="--", linewidth=1.2, alpha=0.8, label=trigger_label)
 
-                        fig, ax = plt.subplots(figsize=(9, 4))
-                        for filt, color in filter_colors.items():
-                            mask_f = ssel_plot["filt"] == filt
-                            if mask_f.any():
-                                det = ssel_plot[mask_f & ssel_plot["mag"].notna() & (ssel_plot["snr_empirical"] >= 3)]
-                                if not det.empty:
-                                    ax.errorbar(det["obs_datetime"].values, det["mag"].values, yerr=det.get("mag_err"), fmt="o", color=color, label=f"Обнаружение ({filt})")
-                                ul = ssel_plot[mask_f & ssel_plot["upper_limit"].notna()]
-                                if not ul.empty:
-                                    ax.scatter(ul["obs_datetime"].values, ul["upper_limit"].values, marker="v", color=color, s=60, alpha=0.6, label=f"Верхний предел ({filt})")
+                    ax.invert_yaxis()
+                    plotted_mags = _pd.concat(
+                        [
+                            ssel_plot.loc[ssel_plot["mag"].notna(), "mag"],
+                            ssel_plot.loc[ssel_plot["upper_limit"].notna(), "upper_limit"],
+                        ],
+                        ignore_index=True,
+                    )
+                    plotted_mags = _pd.to_numeric(plotted_mags, errors="coerce").dropna()
+                    if not plotted_mags.empty:
+                        mag_min = float(plotted_mags.min())
+                        mag_max = float(plotted_mags.max())
+                        margin = max(0.25, 0.08 * (mag_max - mag_min))
+                        ax.set_ylim(mag_max + margin, mag_min - margin)
 
-                        # xticks: use a date locator/formatter so labels do not overlap
-                        import matplotlib.dates as mdates
-                        from matplotlib.dates import DateFormatter
-
-                        locator = mdates.AutoDateLocator()
-                        # Keep explicit year-month-day labels and suppress time text.
-                        formatter = mdates.DateFormatter("%Y-%m-%d")
-                        ax.xaxis.set_major_locator(locator)
-                        ax.xaxis.set_major_formatter(formatter)
-                        fig.autofmt_xdate(rotation=45, ha='right')
-
-                        if trigger_datetime is not None and pd.notna(trigger_datetime):
-                            trigger = pd.to_datetime(trigger_datetime)
-                            ax.axvline(trigger, color="black", linestyle="--", linewidth=1.2, alpha=0.8, label=trigger_label)
-
-                        ax.invert_yaxis()
-                        plotted_mags = _pd.concat(
-                            [
-                                ssel_plot.loc[ssel_plot["mag"].notna(), "mag"],
-                                ssel_plot.loc[ssel_plot["upper_limit"].notna(), "upper_limit"],
-                            ],
-                            ignore_index=True,
+                    ax.set_ylabel("Звёздная величина")
+                    ax.set_title(f"Кривая блеска {oid}")
+                    ax.legend()
+                    if stage1_detections_without_mag:
+                        ax.text(
+                            0.01,
+                            0.02,
+                            f"Срабатывания этапа 1 без измеряемой величины: {stage1_detections_without_mag}",
+                            transform=ax.transAxes,
+                            fontsize=8,
+                            va="bottom",
                         )
-                        plotted_mags = _pd.to_numeric(plotted_mags, errors="coerce").dropna()
-                        if not plotted_mags.empty:
-                            mag_min = float(plotted_mags.min())
-                            mag_max = float(plotted_mags.max())
-                            margin = max(0.25, 0.08 * (mag_max - mag_min))
-                            ax.set_ylim(mag_max + margin, mag_min - margin)
-
-                        ax.set_ylabel("Звёздная величина")
-                        ax.set_title(f"Кривая блеска {oid}")
-                        ax.legend()
-                        plt.tight_layout()
-                        plt.grid(True, alpha=0.3)
-                        plt.savefig(obj_dir / "lightcurve_mag.png", bbox_inches="tight", dpi=400)
-                        plt.close(fig)
-            except Exception:
-                logging.debug("failed to save light curve for %s", oid)
+                    plt.tight_layout()
+                    plt.grid(True, alpha=0.3)
+                    plt.savefig(obj_dir / "lightcurve_mag.png", bbox_inches="tight", dpi=400)
+                    plt.close(fig)
+        except Exception:
+            logging.debug("failed to save light curve for %s", oid)
 
 
 
@@ -3271,7 +3724,14 @@ def stage5_minor_planet_check(
         image_value = stage1_row.get("image_path", candidate.get("diff_path", ""))
         image_path = Path(str(image_value)) if image_value else None
         parsed = parse_diff_name(image_path.name) if image_path is not None else None
-        obs_datetime = _parse_filefracday_datetime(parsed.get("filefracday")) if parsed else pd.NaT
+        filefracday = stage1_row.get("filefracday")
+        if filefracday is None or pd.isna(filefracday) or not str(filefracday).strip():
+            filefracday = parsed.get("filefracday") if parsed else None
+        obs_datetime = (
+            _parse_filefracday_datetime(str(filefracday))
+            if filefracday is not None
+            else pd.NaT
+        )
 
         ra = _safe_float(stage1_row.get("centroid_ra", candidate.get("detection_ra", np.nan)))
         dec = _safe_float(stage1_row.get("centroid_dec", candidate.get("detection_dec", np.nan)))
@@ -3440,23 +3900,14 @@ def main(argv: list[str] | None = None) -> int:
                 limit_images=int(config.get("limit_images", 0)),
                 object_ids=config.get("object_ids", []),
                 resume=resume,
+                full_frames=bool(config.get("blind_search", False)),
             )
             logging.info("Stage0 complete: %s indexed images", len(result))
             return 0
 
         if args.stage == "stage1":
             diff_index = read_stage_csv("stage0/april_stage0_diff_index.csv", "stage0")
-            stage1_images, _ = stage1_quadratic_snr(
-                diff_index,
-                out_root,
-                final_class_df=load_final_class(),
-                snr_threshold=float(config.get("snr_threshold", 3.0)),
-                sigma=float(config.get("sigma", 3.0)),
-                maxiters=int(config.get("maxiters", 5)),
-                min_valid_pixel=float(config.get("min_valid_pixel", -5000.0)),
-                max_workers=int(config.get("snr_workers", 4)),
-                resume=resume,
-            )
+            stage1_images, _ = run_stage1(diff_index, out_root, config, load_final_class(), resume)
             logging.info("Stage1 complete: %s measured images", len(stage1_images))
             return 0
 
@@ -3480,6 +3931,7 @@ def main(argv: list[str] | None = None) -> int:
                 ref_flip_lr=bool(config.get("ref_flip_lr", False)),
                 max_workers=int(config.get("max_workers", 4)),
                 chunk_size=int(config.get("chunk_size", 200)),
+                full_frames=bool(config.get("blind_search", False)),
                 resume=resume,
             )
             logging.info(
@@ -3530,6 +3982,7 @@ def main(argv: list[str] | None = None) -> int:
                 maxiters=int(config.get("maxiters", 5)),
                 min_valid_pixel=float(config.get("min_valid_pixel", -5000.0)),
                 download_missing=bool(config.get("download_missing", True)),
+                full_frames=bool(config.get("blind_search", False)),
                 resume=resume,
             )
             logging.info("Stage3 complete: %s passing objects", len(stage3_objects_pass))
@@ -3592,22 +4045,12 @@ def main(argv: list[str] | None = None) -> int:
 
     final_class_df = pd.read_csv(final_class_csv, low_memory=False)
 
-    diff_index = stage0_diff_index(diff_root, out_root, limit_images=int(config.get("limit_images", 0)), object_ids=config.get("object_ids", []), resume=resume)
+    diff_index = stage0_diff_index(diff_root, out_root, limit_images=int(config.get("limit_images", 0)), object_ids=config.get("object_ids", []), resume=resume, full_frames=bool(config.get("blind_search", False)))
     if diff_index.empty:
         logging.warning("No difference images found")
         return 0
 
-    stage1_images, stage1_objects = stage1_quadratic_snr(
-        diff_index,
-        out_root,
-        final_class_df=final_class_df,
-        snr_threshold=float(config.get("snr_threshold", 3.0)),
-        sigma=float(config.get("sigma", 3.0)),
-        maxiters=int(config.get("maxiters", 5)),
-        min_valid_pixel=float(config.get("min_valid_pixel", -5000.0)),
-        max_workers=int(config.get("snr_workers", 4)),
-        resume=resume,
-    )
+    stage1_images, stage1_objects = run_stage1(diff_index, out_root, config, final_class_df, resume)
     stage1_pass = stage1_images[pd.to_numeric(stage1_images.get("snr_empirical"), errors="coerce") >= float(config.get("snr_threshold", 3.0))].copy()
     if stage1_pass.empty:
         logging.warning("No candidates passed the SNR threshold")
@@ -3624,6 +4067,7 @@ def main(argv: list[str] | None = None) -> int:
         ref_flip_lr=bool(config.get("ref_flip_lr", False)),
         max_workers=int(config.get("max_workers", 4)),
         chunk_size=int(config.get("chunk_size", 200)),
+        full_frames=bool(config.get("blind_search", False)),
         resume=resume,
     )
     if complete_df.empty:
@@ -3655,6 +4099,7 @@ def main(argv: list[str] | None = None) -> int:
         maxiters=int(config.get("maxiters", 5)),
         min_valid_pixel=float(config.get("min_valid_pixel", -5000.0)),
         download_missing=bool(config.get("download_missing", True)),
+        full_frames=bool(config.get("blind_search", False)),
         resume=resume,
     )
 
