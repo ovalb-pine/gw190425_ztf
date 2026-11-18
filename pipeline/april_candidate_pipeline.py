@@ -825,6 +825,50 @@ def run_stage1(diff_index, out_root, config, final_class_df, resume):
     )
 
 
+def _limit_stage1_candidates(stage1_images: pd.DataFrame, limit: int) -> pd.DataFrame:
+    """Keep all detections belonging to the highest-SNR stage-1 candidates."""
+    limit = int(limit)
+    if limit <= 0 or stage1_images.empty:
+        return stage1_images
+    if not {"object_id", "snr_empirical"}.issubset(stage1_images.columns):
+        raise ValueError("Cannot rank stage-1 candidates without object_id and snr_empirical")
+
+    rank_data = pd.DataFrame(
+        {
+            "object_id": stage1_images["object_id"]
+            .where(stage1_images["object_id"].notna(), "")
+            .map(normalize_object_id),
+            "snr_empirical": pd.to_numeric(
+                stage1_images["snr_empirical"], errors="coerce"
+            ),
+        },
+        index=stage1_images.index,
+    )
+    rank_data = rank_data[
+        rank_data["object_id"].ne("")
+        & np.isfinite(rank_data["snr_empirical"])
+    ]
+    if rank_data.empty:
+        raise ValueError("No stage-1 candidates have valid object IDs and empirical SNR")
+    best_snr = rank_data.groupby("object_id", sort=False)["snr_empirical"].max()
+    selected_ids = set(best_snr.nlargest(limit).index)
+    selected = (
+        stage1_images["object_id"]
+        .where(stage1_images["object_id"].notna(), "")
+        .map(normalize_object_id)
+        .isin(selected_ids)
+    )
+    limited = stage1_images.loc[selected].copy()
+    logging.info(
+        "Stage-1 candidate cap: keeping %s of %s candidates by best empirical SNR "
+        "(%s qualifying detections retained)",
+        len(selected_ids),
+        best_snr.size,
+        len(limited),
+    )
+    return limited
+
+
 def _make_triplet_manifest_row(row: pd.Series, diff_path: Path, sci_path: Path, ref_path: Path, status: str, ref_sep_arcsec: float, triplet: np.ndarray | None = None) -> dict:
     record = row.to_dict()
     record.update(
@@ -1992,7 +2036,13 @@ def stage3_pretrigger_magnitude(
                 executor.submit(_fetch_meta_batch, batch): batch
                 for batch in metadata_batches
             }
-            for future in as_completed(futures):
+            for future in tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc="Searching stage-3 archive metadata",
+                unit="batch",
+                dynamic_ncols=True,
+            ):
                 batch_results = future.result()
                 for job, df_meta in batch_results:
                     _save_job_meta(job, df_meta)
@@ -3920,6 +3970,9 @@ def main(argv: list[str] | None = None) -> int:
                 pd.to_numeric(stage1_images.get("snr_empirical"), errors="coerce")
                 >= snr_threshold
             ].copy()
+            stage1_pass = _limit_stage1_candidates(
+                stage1_pass, int(config.get("stage1_top_candidates", 0))
+            )
             manifest_df, complete_df = stage2_triplets(
                 stage1_pass,
                 out_root,
@@ -4052,6 +4105,9 @@ def main(argv: list[str] | None = None) -> int:
 
     stage1_images, stage1_objects = run_stage1(diff_index, out_root, config, final_class_df, resume)
     stage1_pass = stage1_images[pd.to_numeric(stage1_images.get("snr_empirical"), errors="coerce") >= float(config.get("snr_threshold", 3.0))].copy()
+    stage1_pass = _limit_stage1_candidates(
+        stage1_pass, int(config.get("stage1_top_candidates", 0))
+    )
     if stage1_pass.empty:
         logging.warning("No candidates passed the SNR threshold")
         return 0
