@@ -7,6 +7,7 @@ from requests.adapters import HTTPAdapter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from .utils import _load_json, _save_json
 import math
+import random
 import time
 from tqdm import tqdm
 
@@ -21,6 +22,13 @@ Source: https://irsa.ipac.caltech.edu/docs/program_interface/ztf_metadata.html
 # base URL for ZTF data download
 DATA_ROOT = "https://irsa.ipac.caltech.edu/ibe/data/ztf/products"
 
+# IRSA throttles clients that open many connections at once (HTTP 503/429).  Be polite:
+# identify ourselves, cap parallelism, and back off (honouring Retry-After) on transient errors.
+USER_AGENT = "gw190425-ztf-pipeline/1.0 (+https://github.com/ovalb-pine/gw190425_ztf)"
+MAX_IRSA_WORKERS = 4
+TRANSIENT_STATUS = {429, 500, 502, 503, 504}
+MAX_BACKOFF_S = 120
+
 _SESSION = None
 
 
@@ -32,6 +40,7 @@ def get_session():
         adapter = HTTPAdapter(pool_connections=10, pool_maxsize=20, max_retries=0)
         session.mount("http://", adapter)
         session.mount("https://", adapter)
+        session.headers.update({"User-Agent": USER_AGENT, "Accept": "*/*"})
         _SESSION = session
     return _SESSION
 
@@ -135,8 +144,8 @@ def download_file(url, out_dir="ztf_files", timeout=300, overwrite=False, label=
 def batch_download(
     urls,
     out_dir="ztf_files",
-    max_workers=6,
-    max_retries=3,
+    max_workers=4,
+    max_retries=6,
     retry_delay=5,
     *,
     progress=None,
@@ -150,25 +159,43 @@ def batch_download(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     urls = list(urls)
+    if max_workers > MAX_IRSA_WORKERS:
+        tqdm.write(f"max_workers={max_workers} -> {MAX_IRSA_WORKERS} (IRSA returns 503 under heavy parallelism)")
+        max_workers = MAX_IRSA_WORKERS
 
     downloaded = []
     failed = []
     skipped = []
 
+    def _is_transient(exc):
+        if isinstance(exc, requests.HTTPError):
+            resp = exc.response
+            return resp is not None and resp.status_code in TRANSIENT_STATUS
+        return isinstance(exc, (requests.ConnectionError, requests.Timeout,
+                                requests.exceptions.ChunkedEncodingError, OSError))
+
+    def _retry_after_s(exc):
+        resp = getattr(exc, "response", None)
+        value = resp.headers.get("Retry-After") if resp is not None else None
+        try:
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
     def download_with_retry(url, out_dir, label, filtercode):
-        last_exc = None
         for attempt in range(1, max_retries + 1):
             try:
-                result = download_file(url, out_dir, label=label, filtercode=filtercode, **dl_kwargs)
-                return result  # can be None for 404
+                return download_file(url, out_dir, label=label, filtercode=filtercode, **dl_kwargs)  # None for 404
             except Exception as e:
-                last_exc = e
-                if attempt == max_retries:
-                    raise
-                wait = retry_delay * (2 ** (attempt - 1))
-                tqdm.write(f"Retry {attempt}/{max_retries} for {url} in {wait}s")
+                if attempt == max_retries or not _is_transient(e):
+                    raise  # permanent error (401/403/...) or out of attempts
+                wait = _retry_after_s(e)
+                if wait is None:
+                    wait = retry_delay * (2 ** (attempt - 1))
+                wait = min(MAX_BACKOFF_S, wait) * random.uniform(1.0, 1.5)  # jitter: workers must not retry in lockstep
+                status = getattr(getattr(e, "response", None), "status_code", type(e).__name__)
+                tqdm.write(f"Retry {attempt}/{max_retries} ({status}) for {url} in {wait:.0f}s")
                 time.sleep(wait)
-        raise last_exc
 
     own_progress = progress is None
     progress_bar = (
@@ -221,7 +248,7 @@ def batch_download_resumable(
     *,
     out_dir,
     progress_json,
-    max_workers=9,
+    max_workers=4,
     chunk_size=250,
     max_retries=5,
     retry_delay=5,
