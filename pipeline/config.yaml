@@ -24,6 +24,11 @@ psf_visibility_score_min: 2.362838023766029
 candidate_snr_min: 3.0
 candidate_snr_max: 5.0
 braai_threshold: 0.25
+# Catalog tagging (stage 1) and final ranking (stage 6), blind search only
+star_catalog_csv: "../star_catalog.csv"   # made by galaxies/galaxy_list.ipynb
+catalog_match_radius_arcsec: 10.0
+star_penalty: -5                          # points added to star_from_catalog candidates
+asteroid_match_radius_arcsec: 10.0        # SkyBoT match closer than this (or its posunc) = asteroid
 host_rmag_threshold: 20.8
 minor_planet_radius_arcmin: 5.0
 minor_planet_limit_mag: 24.0

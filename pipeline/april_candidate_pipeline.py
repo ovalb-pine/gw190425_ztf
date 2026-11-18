@@ -30,6 +30,7 @@ from braai_batch import build_triplet_batch, load_braai_model, predict_braai_bat
 from ztf_downloads.fetch_sci_ref_for_snr import _build_exact_coord_index, compute_host_offset
 from ztf_downloads.snr_photometry_quadratic import process_difference_image, process_difference_images
 from ztf_downloads.blind_detect import collect_full_diff_index, parse_full_diff_name, stage1_blind_search
+from ztf_downloads.candidate_ranking import build_ranking_table, tag_objects_with_catalogs
 from ztf_downloads.ztf_download import build_cutout_url, build_sci_url, build_ref_url, download_file
 
 
@@ -798,10 +799,41 @@ def stage1_quadratic_snr(
     return merged, summary
 
 
+def stage1_catalog_tags(stage1_objects: pd.DataFrame, out_root: Path, final_class_df: pd.DataFrame, config: dict) -> pd.DataFrame:
+    """Tag every stage-1 object as star_from_catalog / galaxy_from_catalog / no_catalog_match.
+
+    Nobody is rejected: the tag is only carried along to the final ranking
+    (stage 6).  Galaxy catalog = final_class_csv, star catalog = star_catalog_csv.
+    """
+    tags_path = ensure_dir(out_root / "stage1") / "april_stage1_catalog_tags.csv"
+    star_path_value = config.get("star_catalog_csv")
+    star_cat = None
+    if star_path_value:
+        star_path = resolve_cli_path(star_path_value)
+        if star_path.exists():
+            star_cat = pd.read_csv(star_path, low_memory=False)
+        else:
+            logging.warning("star_catalog_csv not found: %s (stars will not be tagged)", star_path)
+    else:
+        logging.warning("star_catalog_csv is not set in the config (stars will not be tagged)")
+
+    tagged = tag_objects_with_catalogs(
+        stage1_objects,
+        final_class_df,
+        star_cat,
+        radius_arcsec=float(config.get("catalog_match_radius_arcsec", 10.0)),
+    )
+    keep = [c for c in ("object_id", "ra", "dec", "catalog_tag", "catalog_sep_arcsec") if c in tagged.columns]
+    write_csv(tagged[keep], tags_path)
+    if not tagged.empty:
+        logging.info("Catalog tags: %s", tagged["catalog_tag"].value_counts().to_dict())
+    return tagged[keep]
+
+
 def run_stage1(diff_index, out_root, config, final_class_df, resume):
     """Galaxy-position SNR (cutouts) or blind full-frame search, chosen by config['blind_search']."""
     if bool(config.get("blind_search", False)):
-        return stage1_blind_search(
+        stage1_images, stage1_objects = stage1_blind_search(
             diff_index,
             out_root,
             snr_threshold=float(config.get("snr_threshold", 3.0)),
@@ -812,6 +844,11 @@ def run_stage1(diff_index, out_root, config, final_class_df, resume):
             max_workers=int(config.get("snr_workers", 4)),
             resume=resume,
         )
+        try:
+            stage1_catalog_tags(stage1_objects, out_root, final_class_df, config)
+        except Exception:
+            logging.exception("Catalog tagging failed; candidates continue untagged")
+        return stage1_images, stage1_objects
     return stage1_quadratic_snr(
         diff_index,
         out_root,
@@ -3892,12 +3929,50 @@ def stage5_minor_planet_check(
     return candidates_df, matches_df
 
 
+def stage6_ranking(out_root: Path, config: dict, trigger_datetime) -> pd.DataFrame:
+    """Final A/B/C hierarchy of the stage-4 candidates (asteroids removed, stars penalised)."""
+
+    def need(rel: str, producer: str) -> pd.DataFrame:
+        df = load_csv_if_exists(out_root / rel)
+        if df is None:
+            raise FileNotFoundError(f"Missing {out_root / rel}. Run --stage {producer} first.")
+        return df
+
+    final_candidates = need("stage4/april_stage4_final_candidates.csv", "stage4")
+    stage1_objects = need("stage1/april_stage1_quadratic_snr_objects.csv", "stage1")
+    braai_scores = need("stage2/april_stage2_braai_scores.csv", "stage2-braai")
+    stage3_images = need("stage3/april_stage3_pretrigger_mag_images.csv", "stage3")
+    catalog_tags = need("stage1/april_stage1_catalog_tags.csv", "stage1")
+    minor_planets = load_csv_if_exists(out_root / "stage5" / "april_stage5_minor_planet_candidates.csv")
+    if minor_planets is None:
+        logging.warning("No stage-5 output: asteroids are NOT removed from the ranking")
+
+    ranked = build_ranking_table(
+        final_candidates,
+        stage1_objects=stage1_objects,
+        braai_scores=braai_scores,
+        stage3_images=stage3_images,
+        catalog_tags=catalog_tags,
+        minor_planets=minor_planets,
+        trigger_datetime=trigger_datetime,
+        parse_filefracday=_parse_filefracday_datetime,
+        normalize_id=normalize_object_id,
+        star_penalty=float(config.get("star_penalty", -5.0)),
+        asteroid_match_radius_arcsec=float(config.get("asteroid_match_radius_arcsec", 10.0)),
+    )
+    stage6_dir = ensure_dir(out_root / "stage6")
+    write_csv(ranked, stage6_dir / "april_stage6_ranked_candidates.csv")
+    if not ranked.empty:
+        logging.info("Ranking: %s", ranked["category"].value_counts().to_dict())
+    return ranked
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the April candidate pipeline")
     parser.add_argument("--config", default="config.yaml", help="Pipeline config YAML")
     parser.add_argument(
         "--stage",
-        choices=("all", "stage0", "stage1", "stage2-triplets", "stage2-braai", "stage3", "stage4", "stage5-minor-planets"),
+        choices=("all", "stage0", "stage1", "stage2-triplets", "stage2-braai", "stage3", "stage4", "stage5-minor-planets", "stage6-ranking"),
         default="all",
         help="Run only this stage; prerequisite stage CSV outputs must already exist",
     )
@@ -4039,6 +4114,11 @@ def main(argv: list[str] | None = None) -> int:
                 resume=resume,
             )
             logging.info("Stage3 complete: %s passing objects", len(stage3_objects_pass))
+            return 0
+
+        if args.stage == "stage6-ranking":
+            ranked = stage6_ranking(out_root, config, trigger_datetime)
+            logging.info("Stage6 ranking complete: %s candidates", len(ranked))
             return 0
 
         if args.stage == "stage5-minor-planets":
@@ -4207,6 +4287,12 @@ def main(argv: list[str] | None = None) -> int:
         )
     except Exception:
         logging.exception("Failed to run stage5 minor-planet check")
+
+    try:
+        ranked = stage6_ranking(out_root, config, trigger_datetime)
+        logging.info("Stage6 ranking complete: %s candidates", len(ranked))
+    except Exception:
+        logging.exception("Failed to run stage6 ranking")
 
     logging.info("Pipeline complete: %s final candidates", len(final_candidates))
     return 0
