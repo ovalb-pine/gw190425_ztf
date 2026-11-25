@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from braai_batch import build_triplet_batch, load_braai_model, predict_braai_batch
 from ztf_downloads.fetch_sci_ref_for_snr import _build_exact_coord_index, compute_host_offset
 from ztf_downloads.snr_photometry_quadratic import process_difference_image, process_difference_images
-from ztf_downloads.blind_detect import collect_full_diff_index, parse_full_diff_name, stage1_blind_search
+from ztf_downloads.blind_detect import collect_full_diff_index, parse_full_diff_name, region_from_config, stage1_blind_search
 from ztf_downloads.candidate_ranking import build_ranking_table, tag_objects_with_catalogs
 from ztf_downloads.ztf_download import build_cutout_url, build_sci_url, build_ref_url, download_file
 
@@ -833,6 +833,9 @@ def stage1_catalog_tags(stage1_objects: pd.DataFrame, out_root: Path, final_clas
 def run_stage1(diff_index, out_root, config, final_class_df, resume):
     """Galaxy-position SNR (cutouts) or blind full-frame search, chosen by config['blind_search']."""
     if bool(config.get("blind_search", False)):
+        blind_region = region_from_config(config.get("blind_region"))
+        if blind_region is None:
+            logging.warning("blind_region is not set: the WHOLE frame of every image is searched")
         stage1_images, stage1_objects = stage1_blind_search(
             diff_index,
             out_root,
@@ -841,6 +844,10 @@ def run_stage1(diff_index, out_root, config, final_class_df, resume):
             min_detections=int(config.get("blind_min_detections", 1)),
             min_epochs=int(config.get("blind_min_epochs", 1)),
             link_radius_arcsec=float(config.get("blind_link_radius_arcsec", 2.0)),
+            single_epoch_snr_min=(
+                None if config.get("blind_single_epoch_snr_min") is None else float(config["blind_single_epoch_snr_min"])
+            ),
+            region=blind_region,
             max_workers=int(config.get("snr_workers", 4)),
             resume=resume,
         )

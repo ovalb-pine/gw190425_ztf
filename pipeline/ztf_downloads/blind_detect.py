@@ -23,9 +23,12 @@ least this bright the image produced (an empirical false-alarm count).
 
 from __future__ import annotations
 
+import json
+import logging
 import re
 import warnings
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
@@ -66,6 +69,55 @@ _FULL_NAME = re.compile(
     r"ztf_(?P<filefracday>\d{14})_(?P<field>\d{6})_(?P<filter>z[gri])"
     r"_c(?P<ccdid>\d+)_o_q(?P<qid>\d)_scimrefdiffimg"
 )
+
+
+# --------------------------------------------------------------------------- #
+# Search region (same box definition as image_download.ipynb)
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class SearchRegion:
+    """Sky box: centre (deg) and *on-sky* half-widths (arcmin).
+
+    The RA extent is half_ra / cos(dec_centre), i.e. the same equal-area box the
+    coverage plots use.  A full-frame image only has to overlap the box; the blind
+    search keeps just the detections that fall inside it.
+    """
+
+    ra_deg: float
+    dec_deg: float
+    half_ra_arcmin: float
+    half_dec_arcmin: float
+
+    def contains(self, ra, dec, margin_arcsec: float = 0.0) -> np.ndarray:
+        ra = np.asarray(ra, dtype=float)
+        dec = np.asarray(dec, dtype=float)
+        m = margin_arcsec / 3600.0
+        half_dec = self.half_dec_arcmin / 60.0 + m
+        half_ra = (self.half_ra_arcmin / 60.0 + m) / np.cos(np.deg2rad(self.dec_deg))
+        dra = (ra - self.ra_deg + 180.0) % 360.0 - 180.0          # wrap-safe
+        with np.errstate(invalid="ignore"):
+            return np.isfinite(ra) & np.isfinite(dec) & (np.abs(dra) <= half_ra) & (np.abs(dec - self.dec_deg) <= half_dec)
+
+    def to_dict(self) -> dict:
+        return {k: round(float(v), 9) for k, v in asdict(self).items()}
+
+
+def region_from_config(cfg: dict | None) -> "SearchRegion | None":
+    """``blind_region: {center_ra, center_dec, half_ra_arcmin, half_dec_arcmin}`` -> SearchRegion.
+
+    center_ra / center_dec accept sexagesimal ("16h29m49s", "+13d21m") or degrees.
+    """
+    if not cfg:
+        return None
+    from astropy import units as u
+    from astropy.coordinates import SkyCoord
+
+    ra, dec = cfg["center_ra"], cfg["center_dec"]
+    try:
+        c = SkyCoord(float(ra) * u.deg, float(dec) * u.deg)
+    except (TypeError, ValueError):
+        c = SkyCoord(str(ra), str(dec))
+    return SearchRegion(float(c.ra.deg), float(c.dec.deg), float(cfg["half_ra_arcmin"]), float(cfg["half_dec_arcmin"]))
 
 
 # --------------------------------------------------------------------------- #
@@ -162,6 +214,7 @@ def detect_in_diff_image(
     min_valid_frac: float = 0.9,
     max_peaks: int = 50000,
     refine_centroid: bool = True,
+    region: SearchRegion | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     """Find and measure all peaks with matched-filter SNR >= ``snr_min``."""
     p = Path(image_path)
@@ -185,6 +238,15 @@ def detect_in_diff_image(
         "n_neg_peaks_ge_snr_min": int((neg_snr >= snr_min).sum()),
         "valid_fraction": float(valid.mean()),
     }
+    stats["n_pos_peaks_whole_image"] = int(len(pos))
+    wcs = WCS(header)
+    wcs = wcs.celestial if getattr(wcs, "naxis", 2) > 2 else wcs
+    if region is not None and len(pos):
+        # Only peaks inside the search box go on to centroiding/photometry (the slow part).
+        # 5" margin: the centroid may move a peak by up to ~1 FWHM; exact cut is applied below.
+        ra0, dec0 = wcs.all_pix2world(pos[:, 0], pos[:, 1], 0)
+        pos = pos[region.contains(ra0, dec0, margin_arcsec=5.0)]
+        stats["n_pos_peaks"] = int(len(pos))
     if len(pos) == 0:
         return pd.DataFrame(), stats
     if len(pos) > max_peaks:
@@ -218,8 +280,6 @@ def detect_in_diff_image(
         mag = np.where(np.isfinite(zp) & (net > 0), zp - 2.5 * np.log10(net), np.nan)
         mag_err = np.where(net > 0, 1.0857362047581294 * flux_err / net, np.nan)
 
-    wcs = WCS(header)
-    wcs = wcs.celestial if getattr(wcs, "naxis", 2) > 2 else wcs
     ra, dec = wcs.all_pix2world(xy[:, 0], xy[:, 1], 0)
 
     n_neg_ge = len(neg_snr) - np.searchsorted(neg_snr, pos[:, 2], side="left")
@@ -261,7 +321,11 @@ def detect_in_diff_image(
             "status": "ok",
         }
     )
-    det = det[det["valid_aperture_frac"] >= float(min_valid_frac)].reset_index(drop=True)
+    det = det[det["valid_aperture_frac"] >= float(min_valid_frac)]
+    if region is not None:
+        det = det[region.contains(det["ra"], det["dec"])]   # exact cut on the refined centroid
+    det = det.reset_index(drop=True)
+    stats["n_detections_kept"] = int(len(det))
     return det, stats
 
 
@@ -296,6 +360,7 @@ def link_detections(
     radius_arcsec: float = 2.0,
     min_detections: int = 1,
     min_epochs: int = 1,
+    single_epoch_snr_min: float | None = None,
     id_prefix: str = "B",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Group detections of the same sky position (friends-of-friends) into objects.
@@ -327,7 +392,12 @@ def link_detections(
         first_obs_date=("filefracday", "min"),
         last_obs_date=("filefracday", "max"),
     )
-    keep = summary[(summary["n_det"] >= min_detections) & (summary["n_epochs"] >= min_epochs)].copy()
+    enough_epochs = summary["n_epochs"] >= min_epochs
+    if single_epoch_snr_min is not None:
+        # An object seen in fewer than ``min_epochs`` exposures is still kept if it is bright enough
+        # to be significant on its own (noise peaks fall off steeply with SNR; see README note).
+        enough_epochs |= summary["best_snr_empirical"] >= float(single_epoch_snr_min)
+    keep = summary[(summary["n_det"] >= min_detections) & enough_epochs].copy()
     keep = keep.sort_values("best_snr_empirical", ascending=False)
     keep["object_id"] = [f"{id_prefix}{i:07d}" for i in range(1, len(keep) + 1)]
 
@@ -362,6 +432,8 @@ def stage1_blind_search(
     min_detections: int = 1,
     min_epochs: int = 1,
     link_radius_arcsec: float = 2.0,
+    single_epoch_snr_min: float | None = None,
+    region: SearchRegion | None = None,
     max_workers: int = 1,
     resume: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -372,12 +444,30 @@ def stage1_blind_search(
     objects_path = stage1_dir / "april_stage1_quadratic_snr_objects.csv"
     stats_path = stage1_dir / "blind_image_stats.csv"
 
+    # The cache is only valid for the settings it was made with: changing the region or the
+    # selection rules re-runs stage 1 (object ids are renumbered, so delete stage 2+ outputs too).
+    settings = {
+        "region": region.to_dict() if region else None,
+        "snr_threshold": float(snr_threshold),
+        "min_detections": int(min_detections),
+        "min_epochs": int(min_epochs),
+        "single_epoch_snr_min": None if single_epoch_snr_min is None else float(single_epoch_snr_min),
+        "link_radius_arcsec": float(link_radius_arcsec),
+    }
+    settings_path = stage1_dir / "blind_settings.json"
+    saved = json.loads(settings_path.read_text()) if settings_path.exists() else None
     if resume and images_path.exists() and objects_path.exists():
-        cached = pd.read_csv(images_path, low_memory=False)
-        if {"object_id", "centroid_ra", "centroid_dec", "snr_empirical"}.issubset(cached.columns):
-            return cached, pd.read_csv(objects_path, low_memory=False)
+        if saved == settings or (saved is None and region is None and single_epoch_snr_min is None):
+            cached = pd.read_csv(images_path, low_memory=False)
+            if {"object_id", "centroid_ra", "centroid_dec", "snr_empirical"}.issubset(cached.columns):
+                return cached, pd.read_csv(objects_path, low_memory=False)
+        else:
+            logging.info("Blind stage-1 settings changed (%s -> %s): recomputing", saved, settings)
 
-    det, image_stats = detect_all(diff_index, workers=max_workers, snr_min=snr_threshold, min_valid_pixel=min_valid_pixel)
+    det, image_stats = detect_all(
+        diff_index, workers=max_workers, snr_min=snr_threshold, min_valid_pixel=min_valid_pixel, region=region
+    )
+    settings_path.write_text(json.dumps(settings, indent=1))
     image_stats.to_csv(stats_path, index=False)
     if det.empty:
         det.to_csv(images_path, index=False)
@@ -385,7 +475,11 @@ def stage1_blind_search(
         return det, pd.DataFrame()
 
     det, objects = link_detections(
-        det, radius_arcsec=link_radius_arcsec, min_detections=min_detections, min_epochs=min_epochs
+        det,
+        radius_arcsec=link_radius_arcsec,
+        min_detections=min_detections,
+        min_epochs=min_epochs,
+        single_epoch_snr_min=single_epoch_snr_min,
     )
     det.to_csv(images_path, index=False)
     objects.to_csv(objects_path, index=False)
